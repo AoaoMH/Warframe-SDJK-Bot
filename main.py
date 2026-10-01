@@ -384,7 +384,7 @@ HELP_TOPIC: dict[str, list[tuple[str, str]]] = {
     ],
     "遗物与资源": [
         ("遗物 / 核桃", "奖励与出处；出库 / 入库 / 列表"),
-        ("开核桃", "遗物收益筛选：速刷|全部 低价|高价"),
+        ("开核桃 / 裂缝", "遗物收益筛选：速刷|全部 低价|高价"),
         ("部件 物品名", "Prime 部件与蓝图出处"),
         ("金垃圾 / 银垃圾 / 铜垃圾", "按杜卡德价值分档清单"),
     ],
@@ -434,7 +434,7 @@ HELP_TOPIC: dict[str, list[tuple[str, str]]] = {
 
 @register("astrbot_plugin_warframe_sdjkbot", "skyti1437",
           f"{BRAND}：世界状态 / 市场查价 / 蹲点推送",
-          "1.1.2")
+          "1.1.3")
 class WarframeSDJK(DailyCommands, ProgressCommands, ArbitrationCommands, RotationCommands, RelicCommands, MarketCommands, RivenCommands, WikiMiscCommands, VisionCommands, ScanCommands, DunCommands, Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
