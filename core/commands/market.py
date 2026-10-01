@@ -21,18 +21,27 @@ from .base import PLUGIN_DIR, Reply
 
 JUNK_FILE = PLUGIN_DIR / "core" / "data" / "junk.json"
 
-# 「头」部件黑话（2026-10-02）：「水晶头」「水晶p头」= 头部部件。
-# ⚠️ 不能进 parser._PART_SPECIFIC —— 语料里 16 个物品名自带「头」（白霜弹头/
-# 分裂弹头/双重弹头 Prime…），石头人/狗头/蘑菇头也是整名黑话，子串剥离会
-# 全部误伤。消歧口径：**整名能精确命中 wm 别名的一律按整名解析**；只有
-# 「整名不是别名、剥掉尾部『头』是别名」才切头部部件。
-def _head_part_from(item: str, alias_lookup) -> Optional[str]:
-    if not item.endswith("头"):
+# 「头」部件黑话消歧（2026-10-02 二修）：「水晶头」「水晶p头」「水晶 头」…
+# = 头部部件。判据（用户口径）：**剥掉尾部「头」后的前缀必须精确存在于
+# 物品名/黑话里**（水晶 → Citrine ✓）——白霜弹头的前缀「白霜弹」不是黑话
+# → 不剥，整名按 MOD 解析。⚠️ 两个教训：
+#   ① 消歧必须在整名解析**之前** —— 首版放在「解析失败→给建议」之后，
+#      整名解析不到根本走不到（用户实测四种写法全挂）；
+#   ② 判据只能用**精确**命中（resolve_wm_exact）—— 模糊链路会把「白霜弹」
+#      沾到白霜（Frost）Prime 上，照样误剥。
+async def _head_part_resolve(client, item: str):
+    """整名以「头」结尾且剥头后的前缀精确命中 → 返回 (剥头物品名, 解析结果)。"""
+    full = item.rstrip()
+    if not full.endswith("头"):
         return None
-    stripped = item[:-1]
-    if stripped and not alias_lookup(item, "wm_items") \
-            and alias_lookup(stripped, "wm_items"):
-        return "头部"
+    stripped = full[:-1].rstrip()
+    if not stripped:
+        return None
+    if await client.resolve_wm_exact(full):
+        return None                      # 整名本身就是 MOD/物品（白霜弹头…）
+    alt = await client.resolve_wm_exact(stripped)
+    if alt:
+        return stripped, alt
     return None
 
 
@@ -74,20 +83,15 @@ class MarketCommands:
                                   "如 wm 母牛 蓝图；头部可连写「头」（wm 水晶头 = wm 水晶 头部）\n"
                                   "品级：满级按物品实际满级（赋能 5 级 / 川流不息 5 级 / "
                                   "生命力 10 级）；精炼档只对遗物，墨染只看墨染 Mod")
-        item = await self.client.resolve_wm_item(q.item)
+        # 「头」部件黑话：消歧在整名解析之前（教训见 _head_part_resolve 注释）
+        _head = await _head_part_resolve(self.client, q.item)
+        if _head:
+            q.item, item = _head
+            q.part = "头部"
+        else:
+            item = await self.client.resolve_wm_item(q.item)
         if not item:
             return await self._wm_suggest(q.item)
-        # 「头」部件黑话（2026-10-02）：「水晶头」「水晶p头」= 头部部件。
-        # 整名精确命中别名的不动（白霜弹头/石头人…），只在剥头后命中别名时
-        # 切头部部件并重解析。
-        if not q.part:
-            _head = _head_part_from(q.item, self.client.alias_lookup)
-            if _head:
-                q.part = _head
-                q.item = q.item[:-1]
-                item = await self.client.resolve_wm_item(q.item)
-                if not item:
-                    return await self._wm_suggest(q.item)
         # ★ 部件关键词（2026-09-19 用户反馈「wm 母牛 蓝图」出的是整套）：
         #   命中具体部件词时切到**该部件**的订单；「配件/部件」泛指时保留
         #   整套 + 部件参考价（见尾部提示）。只在命中套装时生效——
