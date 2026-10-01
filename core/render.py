@@ -273,13 +273,15 @@ MAX_BODY_LINES = 90
 _INDENT_PX = 34
 
 # 卡片水印（小更新 +0.1，首个满意版本升 1.0）。
-# 版本从 core.__version__ 取主次版本、品牌从 core.__brand_card__ 取，
+# 版本从 core.__version__ 取**完整三位**、品牌从 core.__brand_card__ 取，
 # 避免与 metadata.yaml / main.py 注册版本走散
 # （曾经三处各写一份、抬版本或换品牌时漏改，水印留在旧号/旧名上）。
+# ★ 2026-10-02 用户要求：水印/状态卡标题显示**完整版本号**（如 1.1.3），
+#   不再取主次版本（1.1）—— 抬版本时这里无需任何手动改动，单一来源自动跟。
 try:  # pragma: no cover - 兜底分支只在包结构异常时走到
     from . import __version__ as _CORE_VERSION
     from . import __brand_card__ as _CARD_BRAND
-    WATERMARK_VERSION = ".".join(str(_CORE_VERSION).split(".")[:2]) or "1.0"
+    WATERMARK_VERSION = str(_CORE_VERSION) or "1.0"
     CARD_BRAND = str(_CARD_BRAND)
 except Exception:  # noqa: BLE001
     WATERMARK_VERSION = "1.0"
