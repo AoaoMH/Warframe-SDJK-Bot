@@ -73,6 +73,17 @@ check("被占用地区词不抢指令（夜灵=周期）", p.command == "cetus")
 p = parse("夜灵声望")
 check("夜灵声望连写仍->bounty+地球", p.command == "bounty" and p.preset == "地球")
 
+# 黑话补充（2026-10-02）：沉沦=沉沦之地、裂缝=开核桃
+p = parse("沉沦")
+check("沉沦=沉沦之地", p.command == "descendia")
+p = parse("裂缝")
+check("裂缝=开核桃", p.command == "openrelic")
+
+# 无空格连写：ASCII 指令前缀（wm/wmr 最长优先）
+p = parse("wm水晶p头")
+check("无空格连写 wm水晶p头", p.command == "wm" and p.content == ["水晶p头"])
+p = parse("wmr绝路")
+check("无空格连写最长优先 wmr", p.command == "wr" and p.content == ["绝路"])
 p = parse("今天天气不错")
 check("无指令不误触发", p.command is None)
 

@@ -21,6 +21,20 @@ from .base import PLUGIN_DIR, Reply
 
 JUNK_FILE = PLUGIN_DIR / "core" / "data" / "junk.json"
 
+# 「头」部件黑话（2026-10-02）：「水晶头」「水晶p头」= 头部部件。
+# ⚠️ 不能进 parser._PART_SPECIFIC —— 语料里 16 个物品名自带「头」（白霜弹头/
+# 分裂弹头/双重弹头 Prime…），石头人/狗头/蘑菇头也是整名黑话，子串剥离会
+# 全部误伤。消歧口径：**整名能精确命中 wm 别名的一律按整名解析**；只有
+# 「整名不是别名、剥掉尾部『头』是别名」才切头部部件。
+def _head_part_from(item: str, alias_lookup) -> Optional[str]:
+    if not item.endswith("头"):
+        return None
+    stripped = item[:-1]
+    if stripped and not alias_lookup(item, "wm_items") \
+            and alias_lookup(stripped, "wm_items"):
+        return "头部"
+    return None
+
 
 class MarketCommands:
     """Mixin：warframe.market / 排行 / 趋势 handler（挂载于 main.WarframeSDJK）。"""
@@ -57,12 +71,23 @@ class MarketCommands:
             return Reply(raw_text="用法：wm 物品名 [部件] [收购|合购a*2,b] [N个] [零级/满级/N级] "
                                   "[完整/优良/无瑕/光辉] [墨染] [-r]\n"
                                   "部件：蓝图（总图）/ 机体 / 系统 / 头部 / 配件（全部部件比价），"
-                                  "如 wm 母牛 蓝图\n"
+                                  "如 wm 母牛 蓝图；头部可连写「头」（wm 水晶头 = wm 水晶 头部）\n"
                                   "品级：满级按物品实际满级（赋能 5 级 / 川流不息 5 级 / "
                                   "生命力 10 级）；精炼档只对遗物，墨染只看墨染 Mod")
         item = await self.client.resolve_wm_item(q.item)
         if not item:
             return await self._wm_suggest(q.item)
+        # 「头」部件黑话（2026-10-02）：「水晶头」「水晶p头」= 头部部件。
+        # 整名精确命中别名的不动（白霜弹头/石头人…），只在剥头后命中别名时
+        # 切头部部件并重解析。
+        if not q.part:
+            _head = _head_part_from(q.item, self.client.alias_lookup)
+            if _head:
+                q.part = _head
+                q.item = q.item[:-1]
+                item = await self.client.resolve_wm_item(q.item)
+                if not item:
+                    return await self._wm_suggest(q.item)
         # ★ 部件关键词（2026-09-19 用户反馈「wm 母牛 蓝图」出的是整套）：
         #   命中具体部件词时切到**该部件**的订单；「配件/部件」泛指时保留
         #   整套 + 部件参考价（见尾部提示）。只在命中套装时生效——

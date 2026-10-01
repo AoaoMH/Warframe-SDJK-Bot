@@ -89,7 +89,7 @@ COMMAND_ALIASES: dict[str, set[str]] = {
     "tenet": {"信条"},
     "coda": {"终幕"},
     "acrichis": {"言录使"},
-    "descendia": {"沉沦之地", "炼狱塔", "炼狱"},
+    "descendia": {"沉沦之地", "炼狱塔", "炼狱", "沉沦"},
     "incursions": {"侵袭", "钢路侵袭", "钢铁侵袭"},
     # ---- 资料与计算器 ----
     "wiki": {"wiki", "wk", "维基"},
@@ -104,7 +104,7 @@ COMMAND_ALIASES: dict[str, set[str]] = {
     "rank": {"排行", "市场排行"},
     "analysis": {"紫卡分析"},
     "trend": {"趋势", "wm趋势", "价格趋势", "紫卡趋势"},
-    "openrelic": {"开核桃"},
+    "openrelic": {"开核桃", "裂缝"},
     "xh": {"xh", "玄骸"},
     "relic": {"遗物", "核桃"},
     "parts": {"部件", "零件", "组件"},
@@ -172,6 +172,13 @@ for _alias, (_cmd, _preset) in _PRESET_COMMANDS.items():
     ALIAS_TO_COMMAND[_alias.lower()] = _cmd
 # _PRESET_COMMANDS 自身也小写化，方便 parse() 里按 low 取 preset
 _PRESET_COMMANDS = {k.lower(): v for k, v in _PRESET_COMMANDS.items()}
+
+# 无空格连写（2026-10-02 用户反馈「wm水晶p头」静默无响应）：ASCII 指令别名
+# 直接贴着内容时按前缀切开。只收纯 ASCII 指令别名、最长优先（wmr 先于 wm）；
+# 中文指令无此输入习惯且误伤面大（「帮助我」「趋势图」这类正文词），不参与。
+_ASCII_CMD_ALIASES: tuple[str, ...] = tuple(sorted(
+    (a for a in ALIAS_TO_COMMAND if a.isascii() and a.isalpha()),
+    key=len, reverse=True))
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +261,18 @@ def parse(message: str, *, extra_commands: Optional[dict[str, str]] = None) -> P
             if low in _PRESET_COMMANDS:
                 res.preset = _PRESET_COMMANDS[low][1]
             continue
+        if res.command is None:
+            # 无空格连写：「wm水晶p头」= wm + 水晶p头（ASCII 指令前缀，最长优先）
+            for pre in _ASCII_CMD_ALIASES:
+                if low.startswith(pre) and len(low) > len(pre):
+                    res.command_raw = pre
+                    res.command = alias_table[pre]
+                    if pre in _PRESET_COMMANDS:
+                        res.preset = _PRESET_COMMANDS[pre][1]
+                    res.content.append(tok[len(pre):])
+                    break
+            if res.command is not None:
+                continue
         res.content.append(tok)
     return res
 

@@ -89,6 +89,21 @@ check("系统 → 系统蓝图",
 check("不存在的部件 → None（上层给准确提示）", pick(parts, "枪管") is None)
 
 print()
+print("=== 三、「头」部件黑话消歧（整名别名优先，2026-10-02）===")
+from core.commands.market import _head_part_from               # noqa: E402
+
+_alias = {"水晶": "citrine_prime_set", "水晶p": "citrine_prime_set",
+          "白霜弹头": "rime_rounds", "石头人": "atlas_prime_set",
+          "母牛": "hildryn_prime_set"}
+_lookup = lambda k, t="wm_items": _alias.get(k)                # noqa: E731
+check("水晶头 → 头部", _head_part_from("水晶头", _lookup) == "头部")
+check("水晶p头 → 头部", _head_part_from("水晶p头", _lookup) == "头部")
+check("整名是别名不剥：白霜弹头", _head_part_from("白霜弹头", _lookup) is None)
+check("整名是别名不剥：石头人", _head_part_from("石头人", _lookup) is None)
+check("剥头后也不是别名：狗头", _head_part_from("狗头", _lookup) is None)
+check("不以头结尾不处理：母牛", _head_part_from("母牛", _lookup) is None)
+
+print()
 if _fails:
     print(f"✗ {len(_fails)} 项失败: {_fails}")
     raise SystemExit(1)
