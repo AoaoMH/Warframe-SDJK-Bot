@@ -19,9 +19,11 @@
   - 内容层的二级解析（wm / wr / 蹲 / 裂隙筛选）由各 handler 调用本模块的
     parse_wm() / parse_wr() / parse_fissure_filter() / parse_duration() 完成。
 """
+
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
@@ -34,12 +36,18 @@ from typing import Iterable, Optional
 PLATFORMS = ("pc", "ps", "xb", "sw")
 PLATFORM_ALIASES = {
     "pc": "pc",
-    "ps": "ps", "ps4": "ps", "ps5": "ps", "playstation": "ps",
-    "xb": "xb", "xbox": "xb", "series": "xb",
-    "sw": "sw", "switch": "sw", "任天堂": "sw",
+    "ps": "ps",
+    "ps4": "ps",
+    "ps5": "ps",
+    "playstation": "ps",
+    "xb": "xb",
+    "xbox": "xb",
+    "series": "xb",
+    "sw": "sw",
+    "switch": "sw",
+    "任天堂": "sw",
 }
-PLATFORM_DISPLAY = {"pc": "国际服", "ps": "国际服",
-                    "xb": "国际服", "sw": "国际服"}
+PLATFORM_DISPLAY = {"pc": "国际服", "ps": "国际服", "xb": "国际服", "sw": "国际服"}
 
 _MODIFIER_RE = re.compile(r"^-(?P<body>[A-Za-z0-9]+)$")
 
@@ -69,7 +77,11 @@ COMMAND_ALIASES: dict[str, set[str]] = {
     "calendar": {"日历", "1999日历"},
     "deeparchimedea": {"深层科研", "深层"},
     "temporalarchimedea": {"时光科研", "时光"},
-    "steelpath": {"钢铁之路"},
+    "steelpath": {"钢铁之路", "钢精"},
+    # ★ 2026-10-03（B1）：中英名称对照（纯文本）
+    "translate": {"翻译"},
+    # ★ 2026-10-03（A3）：Palladino 裂罅碎块商店（地球「钢铁守望」）
+    "slivershop": {"碎银兑换", "碎银"},
     "arbitration": {"仲裁"},
     "arbtable": {"仲裁表"},
     "alerts": {"警报"},
@@ -125,15 +137,22 @@ _PRESET_COMMANDS: dict[str, tuple[str, str]] = {
     "银垃圾": ("ducats", "银"),
     "铜垃圾": ("ducats", "铜"),
     # 分类排行
-    "甲排行": ("rank", "甲"), "战甲排行": ("rank", "甲"),
-    "卡排行": ("rank", "卡"), "MOD排行": ("rank", "卡"),
-    "部件排行": ("rank", "部件"), "赋能排行": ("rank", "赋能"),
-    "主武排行": ("rank", "主武"), "主武器排行": ("rank", "主武"),
-    "副武排行": ("rank", "副武"), "副武器排行": ("rank", "副武"),
-    "近战排行": ("rank", "近战"), "遗物排行": ("rank", "遗物"),
+    "甲排行": ("rank", "甲"),
+    "战甲排行": ("rank", "甲"),
+    "卡排行": ("rank", "卡"),
+    "MOD排行": ("rank", "卡"),
+    "部件排行": ("rank", "部件"),
+    "赋能排行": ("rank", "赋能"),
+    "主武排行": ("rank", "主武"),
+    "主武器排行": ("rank", "主武"),
+    "副武排行": ("rank", "副武"),
+    "副武器排行": ("rank", "副武"),
+    "近战排行": ("rank", "近战"),
+    "遗物排行": ("rank", "遗物"),
     "紫卡排行": ("rank", "紫卡"),
     # 遗物入库 / 出库
-    "遗物列表": ("relic", "列表"), "遗物入库": ("relic", "入库"),
+    "遗物列表": ("relic", "列表"),
+    "遗物入库": ("relic", "入库"),
     "遗物出库": ("relic", "出库"),
     "开核桃速刷": ("openrelic", "速刷"),
 }
@@ -153,14 +172,30 @@ for _cmd, _aliases in COMMAND_ALIASES.items():
 #   ⚠️ 裸词若已被其他主指令占用则跳过（夜灵/平原 → 周期指令），连写不受影响。
 # ---------------------------------------------------------------------------
 _BOUNTY_REGIONS: dict[str, str] = {
-    "地球": "地球", "希图斯": "地球", "尸鬼": "地球", "夜灵": "地球",
-    "金星": "金星", "山谷": "金星", "奥布": "金星", "索拉里": "金星",
+    "地球": "地球",
+    "希图斯": "地球",
+    "尸鬼": "地球",
+    "夜灵": "地球",
+    "金星": "金星",
+    "山谷": "金星",
+    "奥布": "金星",
+    "索拉里": "金星",
     "福尔图娜": "金星",
-    "火卫二": "火卫二", "魔胎": "火卫二", "英择谛": "火卫二", "隔离库": "火卫二",
-    "深矿": "深矿", "抢劫": "深矿",
-    "扎里曼": "扎里曼", "羽化": "扎里曼", "虚空天使": "扎里曼",
-    "圣所": "圣所", "实验室": "圣所", "解剖": "圣所",
-    "1999": "1999", "六人组": "1999", "霍瓦尼亚": "1999",
+    "火卫二": "火卫二",
+    "魔胎": "火卫二",
+    "英择谛": "火卫二",
+    "隔离库": "火卫二",
+    "深矿": "深矿",
+    "抢劫": "深矿",
+    "扎里曼": "扎里曼",
+    "羽化": "扎里曼",
+    "虚空天使": "扎里曼",
+    "圣所": "圣所",
+    "实验室": "圣所",
+    "解剖": "圣所",
+    "1999": "1999",
+    "六人组": "1999",
+    "霍瓦尼亚": "1999",
 }
 for _w, _region in _BOUNTY_REGIONS.items():
     if _w not in ALIAS_TO_COMMAND:  # 「夜灵」已归周期指令 → 只保留连写形式
@@ -176,9 +211,9 @@ _PRESET_COMMANDS = {k.lower(): v for k, v in _PRESET_COMMANDS.items()}
 # 无空格连写（2026-10-02 用户反馈「wm水晶p头」静默无响应）：ASCII 指令别名
 # 直接贴着内容时按前缀切开。只收纯 ASCII 指令别名、最长优先（wmr 先于 wm）；
 # 中文指令无此输入习惯且误伤面大（「帮助我」「趋势图」这类正文词），不参与。
-_ASCII_CMD_ALIASES: tuple[str, ...] = tuple(sorted(
-    (a for a in ALIAS_TO_COMMAND if a.isascii() and a.isalpha()),
-    key=len, reverse=True))
+_ASCII_CMD_ALIASES: tuple[str, ...] = tuple(
+    sorted((a for a in ALIAS_TO_COMMAND if a.isascii() and a.isalpha()), key=len, reverse=True)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -189,16 +224,16 @@ class Parsed:
     """一条用户消息的解析产物。"""
 
     raw: str = ""
-    command: Optional[str] = None        # canonical 主指令
-    command_raw: Optional[str] = None    # 原始触发词
-    preset: Optional[str] = None         # 别名携带的预设内容（如 金垃圾→"金"）
-    content: list[str] = field(default_factory=list)   # 查询内容 token
+    command: Optional[str] = None  # canonical 主指令
+    command_raw: Optional[str] = None  # 原始触发词
+    preset: Optional[str] = None  # 别名携带的预设内容（如 金垃圾→"金"）
+    content: list[str] = field(default_factory=list)  # 查询内容 token
     modifiers: list[str] = field(default_factory=list)  # 已识别修饰符原文
-    platform: Optional[str] = None       # -pc/-ps/...
-    text_mode: bool = False              # -w / -1
-    image_mode: bool = False             # -t
-    whisper: bool = False                # -r
-    page: int = 1                        # -2 / -3 ...
+    platform: Optional[str] = None  # -pc/-ps/...
+    text_mode: bool = False  # -w / -1
+    image_mode: bool = False  # -t
+    whisper: bool = False  # -r
+    page: int = 1  # -2 / -3 ...
     unknown_modifiers: list[str] = field(default_factory=list)
 
     @property
@@ -269,7 +304,7 @@ def parse(message: str, *, extra_commands: Optional[dict[str, str]] = None) -> P
                     res.command = alias_table[pre]
                     if pre in _PRESET_COMMANDS:
                         res.preset = _PRESET_COMMANDS[pre][1]
-                    res.content.append(tok[len(pre):])
+                    res.content.append(tok[len(pre) :])
                     break
             if res.command is not None:
                 continue
@@ -284,9 +319,22 @@ def parse(message: str, *, extra_commands: Optional[dict[str, str]] = None) -> P
 # ---------------------------------------------------------------------------
 RIVEN_STAT_ALIASES: dict[str, set[str]] = {
     "melee_damage": {"近战伤害", "基伤", "基础伤害", "近战", "基础", "基"},
-    "crit_chance": {"暴击几率", "暴率", "暴击率", "爆击率", "爆率", "爆击几率",
-                    "暴击概率", "爆击概率", "暴击", "爆击", "暴", "爆",
-                    "爆率几率", "暴几率"},
+    "crit_chance": {
+        "暴击几率",
+        "暴率",
+        "暴击率",
+        "爆击率",
+        "爆率",
+        "爆击几率",
+        "暴击概率",
+        "爆击概率",
+        "暴击",
+        "爆击",
+        "暴",
+        "爆",
+        "爆率几率",
+        "暴几率",
+    },
     "crit_damage": {"暴击伤害", "暴伤", "爆伤", "爆击伤害", "暴击伤", "爆击伤"},
     "multishot": {"多重射击", "多重", "多"},
     "attack_speed": {"攻击速度", "攻速", "速度"},
@@ -297,14 +345,26 @@ RIVEN_STAT_ALIASES: dict[str, set[str]] = {
     "initial_combo": {"初始连击", "初始连击数", "连击数"},
     "combo_duration": {"连击持续时间", "连击时间"},
     "heavy_attack_efficiency": {"重击效率"},
-    "combo_efficiency": {"近战连击效率", "连击效率"},
+    # ★ 2026-10-02 归并（用户拍板）：原 combo_efficiency（「连击效率」）在 WM 32
+    #   属性与官方基值表里都没有对应行，基值却等于「额外连击数几率」的 58.77 ——
+    #   属早期误录的幽灵 sid。按用户决定归并到额外连击数几率，这两个词不再单列。
     "finisher_damage": {"处决伤害", "处决"},
-    "slide_crit": {"滑行攻击时暴击率", "滑暴", "滑行暴击几率", "滑行暴击",
-                   "滑爆", "滑行爆击", "滑行", "滑行攻击",
-                   # ★ 2026-09-24：卡面原文就是「滑行攻击暴击几率」——不含「滑暴」
-                   #   子串，包含匹配会落到短名「暴击」(crit_chance)，让反推倾向
-                   #   整卡作废（滑行暴击基值 180 被当普通暴击用不上）。
-                   "滑行攻击暴击几率", "滑行攻击暴击率", "滑行攻击爆击几率"},
+    "slide_crit": {
+        "滑行攻击时暴击率",
+        "滑暴",
+        "滑行暴击几率",
+        "滑行暴击",
+        "滑爆",
+        "滑行爆击",
+        "滑行",
+        "滑行攻击",
+        # ★ 2026-09-24：卡面原文就是「滑行攻击暴击几率」——不含「滑暴」
+        #   子串，包含匹配会落到短名「暴击」(crit_chance)，让反推倾向
+        #   整卡作废（滑行暴击基值 180 被当普通暴击用不上）。
+        "滑行攻击暴击几率",
+        "滑行攻击暴击率",
+        "滑行攻击爆击几率",
+    },
     "slash_damage": {"切割伤害", "切割"},
     "impact_damage": {"冲击伤害", "冲击"},
     "puncture_damage": {"穿刺伤害", "穿刺"},
@@ -312,17 +372,44 @@ RIVEN_STAT_ALIASES: dict[str, set[str]] = {
     "cold_damage": {"冰冻伤害", "冰伤", "冰", "冰冻"},
     "toxin_damage": {"毒素伤害", "毒伤", "毒", "毒素"},
     "electric_damage": {"电击伤害", "电伤", "电", "电击"},
-    "damage_vs_grineer": {"对Grineer伤害", "G系伤害", "G伤", "Grineer伤害",
-                          "G佬伤害", "G系", "G佬", "G歧视", "G",
-                          # ★ 2026-09-27：卡面原文带「的」（「对 Grineer 的伤害」），
-                          #   逐行解析读到的是卡面原文，不带这个别名会整条认不出。
-                          "对Grineer的伤害"},
-    "damage_vs_corpus": {"对Corpus伤害", "C系伤害", "C伤", "Corpus伤害",
-                         "C佬伤害", "C系", "C佬", "C歧视", "C",
-                         "对Corpus的伤害"},
-    "damage_vs_infested": {"对Infested伤害", "I系伤害", "I伤", "Infested伤害",
-                           "I佬伤害", "I系", "I佬", "I歧视", "I",
-                           "对Infested的伤害"},
+    "damage_vs_grineer": {
+        "对Grineer伤害",
+        "G系伤害",
+        "G伤",
+        "Grineer伤害",
+        "G佬伤害",
+        "G系",
+        "G佬",
+        "G歧视",
+        "G",
+        # ★ 2026-09-27：卡面原文带「的」（「对 Grineer 的伤害」），
+        #   逐行解析读到的是卡面原文，不带这个别名会整条认不出。
+        "对Grineer的伤害",
+    },
+    "damage_vs_corpus": {
+        "对Corpus伤害",
+        "C系伤害",
+        "C伤",
+        "Corpus伤害",
+        "C佬伤害",
+        "C系",
+        "C佬",
+        "C歧视",
+        "C",
+        "对Corpus的伤害",
+    },
+    "damage_vs_infested": {
+        "对Infested伤害",
+        "I系伤害",
+        "I伤",
+        "Infested伤害",
+        "I佬伤害",
+        "I系",
+        "I佬",
+        "I歧视",
+        "I",
+        "对Infested的伤害",
+    },
     "magazine_capacity": {"弹匣容量", "弹匣", "弹夹", "弹夹容量", "弹容"},
     "ammo_max": {"弹药最大值", "弹药", "弹药上限"},
     "projectile_speed": {"投射物速度", "弹道", "投射", "弹道飞行速度", "弹道速度"},
@@ -330,12 +417,37 @@ RIVEN_STAT_ALIASES: dict[str, set[str]] = {
     "reload_speed": {"装填速度", "装填", "装弹"},
     "recoil": {"武器后坐力", "后坐", "后坐力", "后座", "后座力"},
     "zoom": {"变焦", "缩放"},
-    "extra_combo_count": {"额外连击数", "额外连击", "额外连击数几率",
-                          "减连击获取", "减额外连击数几率",
-                          "减额外连击", "减额外连击数"},
+    "extra_combo_count": {
+        "额外连击数",
+        "额外连击",
+        "额外连击数几率",
+        "减连击获取",
+        "减额外连击数几率",
+        "减额外连击",
+        "减额外连击数",
+        # ★ 2026-10-02 归并自原 combo_efficiency 幽灵 sid
+        "连击效率",
+        "近战连击效率",
+    },
     # WM slug chance_to_gain_combo_count（仅负向；DE 官方文案「…% 的几率来获得连击数」）
-    "combo_gain_chance": {"连击数获取几率", "获得连击数几率", "连击获取几率",
-                          "连击获取", "连击数获取", "获得连击数", "连击数几率"},
+    "combo_gain_chance": {
+        "连击数获取几率",
+        "获得连击数几率",
+        "连击获取几率",
+        "连击获取",
+        "连击数获取",
+        "获得连击数",
+        "连击数几率",
+        # ★ 2026-10-02：中文 wiki 基值表里该词条（104.85%，
+        #   「³ 仅负向」）的中文行名 —— 缺它会整行「认不出」
+        "几率不获得连击数",
+        "不获得连击数几率",
+        #   用户实卡（翁 Locti-acrium）卡面原文：
+        #   「-60.4% 的几率来获得连击数」（剥数值后如下）
+        "的几率来获得连击数",
+        "几率来获得连击数",
+        "来获得连击数",
+    },
 }
 # 组合词：一个别名展开为多个词条需求
 RIVEN_STAT_COMBOS: dict[str, list[str]] = {
@@ -365,23 +477,41 @@ RIVEN_URL_COMPAT: dict[str, str] = {
 }
 # 标准词条 id -> 展示主中文名（拍卖展示用，精选短名）
 RIVEN_STAT_ZH: dict[str, str] = {
-    "melee_damage": "基伤", "crit_chance": "暴击", "crit_damage": "暴伤",
-    "multishot": "多重", "attack_speed": "攻速", "fire_rate": "射速",
-    "status_chance": "触发", "status_duration": "触时", "range": "范围",
-    "initial_combo": "初始连击", "combo_duration": "连击时间",
-    "heavy_attack_efficiency": "重击效率", "combo_efficiency": "连击效率",
-    "finisher_damage": "处决伤", "slide_crit": "滑暴",
-    "slash_damage": "切割", "impact_damage": "冲击", "puncture_damage": "穿刺",
-    "heat_damage": "火伤", "cold_damage": "冰伤", "toxin_damage": "毒伤",
+    "melee_damage": "基伤",
+    "crit_chance": "暴击",
+    "crit_damage": "暴伤",
+    "multishot": "多重",
+    "attack_speed": "攻速",
+    "fire_rate": "射速",
+    "status_chance": "触发",
+    "status_duration": "触时",
+    "range": "范围",
+    "initial_combo": "初始连击",
+    "combo_duration": "连击时间",
+    "heavy_attack_efficiency": "重击效率",
+    "finisher_damage": "处决伤",
+    "slide_crit": "滑暴",
+    "slash_damage": "切割",
+    "impact_damage": "冲击",
+    "puncture_damage": "穿刺",
+    "heat_damage": "火伤",
+    "cold_damage": "冰伤",
+    "toxin_damage": "毒伤",
     "electric_damage": "电伤",
-    "damage_vs_grineer": "G伤", "damage_vs_corpus": "C伤",
+    "damage_vs_grineer": "G伤",
+    "damage_vs_corpus": "C伤",
     "damage_vs_infested": "I伤",
-    "magazine_capacity": "弹匣", "ammo_max": "弹药",
-    "projectile_speed": "弹道", "punch_through": "穿透",
-    "reload_speed": "装填", "recoil": "后坐", "zoom": "变焦",
+    "magazine_capacity": "弹匣",
+    "ammo_max": "弹药",
+    "projectile_speed": "弹道",
+    "punch_through": "穿透",
+    "reload_speed": "装填",
+    "recoil": "后坐",
+    "zoom": "变焦",
     # 官方名分别是「额外连击数几率」「…% 的几率来获得连击数」（DE 本地化），
     # 旧值「减连击」与官方语义不符（该词条 WM 标记为正向词条）。
-    "extra_combo_count": "额外连击", "combo_gain_chance": "连击获取",
+    "extra_combo_count": "额外连击",
+    "combo_gain_chance": "连击获取",
 }
 # 负面语义修饰词
 _ANY_MARK = {"任意", "有", "是"}
@@ -438,16 +568,18 @@ def segment_stats(blob: str) -> Optional[list[str]]:
 class WRQuery:
     """wr / rm 紫卡拍卖查询的二级解析结果。"""
 
-    weapon: str = ""                      # 武器名（原样，供模糊匹配）
-    stats: list[str] = field(default_factory=list)          # 要求的正/负词条（内部标准名）
-    negatives: list[str] = field(default_factory=list)      # 负面条词条
-    require_negative: bool = False        # 带负（任意负面）
-    forbid_negative: bool = False         # 无负
-    polarity: Optional[str] = None        # madurai/vazarin/naramon/zenurik
-    max_price: Optional[int] = None       # 1000p
-    max_rerolls: Optional[int] = None     # 零洗/低洗（≤8）
-    rerolls_min: Optional[int] = None     # 废洗（≥10）
-    status: str = "recent"                # latest(仅游戏中)/recent(+在线)/offline(全部)
+    weapon: str = ""  # 武器名（原样，供模糊匹配）
+    stats: list[str] = field(default_factory=list)  # 要求的正/负词条（内部标准名）
+    negatives: list[str] = field(default_factory=list)  # 负面条词条
+    require_negative: bool = False  # 带负（任意负面）
+    forbid_negative: bool = False  # 无负
+    polarity: Optional[str] = None  # madurai/vazarin/naramon/zenurik
+    max_price: Optional[int] = None  # 1000p
+    min_price: Optional[int] = None  # 500p以上（2026-10-01 补占位；服务端忽略
+    # price_min/max ⇒ 消费端 _auction_match 本地过滤）
+    max_rerolls: Optional[int] = None  # 零洗/低洗（≤8）
+    rerolls_min: Optional[int] = None  # 废洗（≥10）
+    status: str = "recent"  # latest(仅游戏中)/recent(+在线)/offline(全部)
     positive_count: Optional[int] = None  # 2+ / 3+
     negative_count: Optional[int] = None  # 2+1 的"1"
 
@@ -457,10 +589,16 @@ class WRQuery:
 
 
 _POLARITY_MAP = {
-    "r槽": "madurai", "v槽": "madurai", "m槽": "madurai", "麦槽": "madurai",
+    "r槽": "madurai",
+    "v槽": "madurai",
+    "m槽": "madurai",
+    "麦槽": "madurai",
     "d槽": "vazarin",
-    "-槽": "naramon", "一槽": "naramon",
-    "角槽": "zenurik", "zen槽": "zenurik", "皇槽": "zenurik",
+    "-槽": "naramon",
+    "一槽": "naramon",
+    "角槽": "zenurik",
+    "zen槽": "zenurik",
+    "皇槽": "zenurik",
 }
 _STATUS_MAP = {"最新": "latest", "最近": "recent", "在线": "recent", "离线": "offline"}
 _REROLL_WORDS = {"零洗": (0, 0), "低洗": (1, 8), "废洗": (10, None)}
@@ -503,7 +641,7 @@ def parse_wr(content: Iterable[str]) -> WRQuery:
         if tok in ("任意", "有", "是") and (neg_side or not weapon_parts):
             q.require_negative = True
             continue
-        if tok in ("没有", "无", "不") :
+        if tok in ("没有", "无", "不"):
             q.forbid_negative = True
             continue
         # —— 词条串：可能带 负/带负 标记，可能正负连写
@@ -569,8 +707,12 @@ def _split_negatives(tok: str) -> Optional[list[tuple[str, bool]]]:
                 i += 1
         if buf:
             parts.append((buf, neg))
-        if not parts and neg:
-            # 「负」/「带负」单独成词：负面侧为空
+        if neg and (not parts or not parts[-1][1]):
+            # ★ 2026-10-01 修：「任意负」结尾的「负」曾把 neg=True 标在半路就丢——
+            #   只要结尾时 neg 为 True 且最后一个片段不在负面侧，就补一个空负面片段
+            #   （parse_wr 里 ("", True) ⇒ require_negative=True）。
+            #   既有行为不受影响：「负变焦」→ [("变焦",True)]（尾片段已是负面）；
+            #   「双暴负变焦」→ [("双暴",False),("变焦",True)]。
             parts.append(("", True))
         return parts
     # 无负面标记：整词必须是（组合）词条才吃掉
@@ -586,23 +728,50 @@ def _split_negatives(tok: str) -> Optional[list[tuple[str, bool]]]:
 class WMQuery:
     """wm 普通物品买卖单查询。"""
 
-    item: str = ""                 # 物品名（EN 或 CN 别名）
-    buy: bool = False              # 收购（查看收购单）
+    item: str = ""  # 物品名（EN 或 CN 别名）
+    buy: bool = False  # 收购（查看收购单）
     group_buy: Optional[list[tuple[str, int]]] = None  # 合购 [(item, qty)]
     quantity: Optional[int] = None  # 3个 -> 同时出售 >= 3
-    rank: Optional[int] = None      # 零级/满级/3级；满级用 -1 表示
-    rank_word: str = ""             # 原始 rank 词（展示用）
+    rank: Optional[int] = None  # 零级/满级/3级；满级用 -1 表示
+    rank_word: str = ""  # 原始 rank 词（展示用）
     refinement: Optional[str] = None  # 完整/优良/无暇/光辉 → WM subtype
-    refinement_word: str = ""       # 原始精炼词（提示语回显用）
-    moran: bool = False             # 墨染（Atragraph / Foil Mod，subtype=atragraph）
-    part: str = ""                  # 部件关键词（蓝图/机体/系统/头部/配件…）
+    refinement_word: str = ""  # 原始精炼词（提示语回显用）
+    moran: bool = False  # 墨染（Atragraph / Foil Mod，subtype=atragraph）
+    part: str = ""  # 部件关键词（蓝图/机体/系统/头部/配件…）
 
 
 # ★ 部件关键词（2026-09-19 用户反馈「wm 母牛 蓝图」搜出来全是整套）：
 #   具体部件词（机体/头部/系统/枪管/枪机/枪托/头盔/蓝图/总图）命中后，
 #   查询会切到该部件的订单而不是整套；「配件/部件」泛指 → 保留整套 +
 #   部件参考价。★ 具体词优先于「蓝图」——「机体蓝图」是机体，不是总图。
-_PART_SPECIFIC = ("头部神经", "机体", "头部", "系统", "枪管", "枪机", "枪托", "头盔")
+_PART_SPECIFIC = (
+    "头部神经",
+    "机体",
+    "头部",
+    "系统",
+    "枪管",
+    "枪机",
+    "枪托",
+    "头盔",
+    # ★ 2026-10-05 扩充（近战/弓/守护/副手/投掷/殁世机甲）：对 843 个
+    #   component/blueprint 中文名做尾词频后，补上表内缺失的高频部件词。
+    #   此前 `wm 格拉姆p 刀刃` 解析不到部件（「p 后缀 + 部件词缺」互相放大）。
+    #   ⚠ 这些词会与少数 MOD 名相撞（簧压刀刃/爆裂刀刃/锐利刀刃、燃烧外壳/
+    #   低温外壳/魔导·外壳）—— 与既有「头盔/枪管」同类；由 `_h_wm` 的
+    #   「拆件失败 → 原文重组再试」兜底处理（market.py）。
+    "握柄",
+    "刀刃",
+    "连接器",
+    "外壳",
+    "弓弦",
+    "弓身",
+    "上弓臂",
+    "下弓臂",
+    "拳套",
+    "武器舱",
+    "镖袋",
+    "护手",
+)
 _PART_GENERIC = ("蓝图", "总图")
 _PART_ANY = ("配件", "部件")
 # 跨 token 的部件词优先级：具体部件词（2）> 蓝图/总图（1）> 配件泛指（0）。
@@ -625,7 +794,7 @@ def _extract_part(tok: str) -> tuple[str, str]:
     part = ""
     for w in _PART_SPECIFIC:
         if w in rest:
-            part = ("头部" if w in ("头部", "头部神经") else w)
+            part = "头部" if w in ("头部", "头部神经") else w
             rest = rest.replace(w, "", 1)
             break
     if not part:
@@ -642,8 +811,7 @@ def _extract_part(tok: str) -> tuple[str, str]:
                 break
     if part:
         # 剥掉同 token 里残留的部件限定词（「机体蓝图」「头部神经光元」…）
-        for w in (_PART_GENERIC + _PART_ANY
-                  + ("神经光元", "神经元", "光元")):
+        for w in _PART_GENERIC + _PART_ANY + ("神经光元", "神经元", "光元"):
             rest = rest.replace(w, "")
         rest = rest.strip()
     return rest, part
@@ -652,8 +820,13 @@ def _extract_part(tok: str) -> tuple[str, str]:
 # 遗物精炼档：**官方简中「无瑕」在前、社区错写「无暇」兼容**（2026-09-25 总任务会话
 # 复核报障：帮助卡/KB 文案用的是官方「无瑕」，词典只收了「无暇」→ 照帮助卡输入时
 # 该词不被消费，会残留在物品名里且精炼档过滤静默失效）。
-_REFINEMENT_MAP = {"完整": "intact", "优良": "exceptional",
-                   "无瑕": "flawless", "无暇": "flawless", "光辉": "radiant"}
+_REFINEMENT_MAP = {
+    "完整": "intact",
+    "优良": "exceptional",
+    "无瑕": "flawless",
+    "无暇": "flawless",
+    "光辉": "radiant",
+}
 
 
 def parse_wm(content: Iterable[str], preset: Optional[str] = None) -> WMQuery:
@@ -686,7 +859,7 @@ def parse_wm(content: Iterable[str], preset: Optional[str] = None) -> WMQuery:
         else:
             rest, part = _extract_part(tok)
             if part and _PART_STRENGTH[part] >= _PART_STRENGTH.get(q.part, -1):
-                q.part = part   # 具体部件 > 蓝图 > 配件（跨 token 不被弱词覆盖）
+                q.part = part  # 具体部件 > 蓝图 > 配件（跨 token 不被弱词覆盖）
             if rest:
                 item_parts.append(rest)
         i += 1
@@ -715,28 +888,57 @@ MISSION_CN: dict[str, str] = {
     # EN -> CN（展示 + 反查共用）。中文名以 **DE 官方简中**为准 ——
     # `de_worldstate.mission_type()` 输出的就是这套（游戏内文本），
     # 两边必须同名，`FissureFilter` 才匹配得上。
-    "capture": "捕获", "exterminate": "歼灭", "survival": "生存",
-    "defense": "防御",     "interception": "拦截", "extermination": "歼灭",
-    "defection": "叛逃", "infested salvage": "INFESTED 资源回收",
-    "recovery": "回收", "pursuit": "追击", "salvage": "打捞",
+    "capture": "捕获",
+    "exterminate": "歼灭",
+    "survival": "生存",
+    "defense": "防御",
+    "interception": "拦截",
+    "extermination": "歼灭",
+    "defection": "叛逃",
+    "infested salvage": "INFESTED 资源回收",
+    "recovery": "回收",
+    "pursuit": "追击",
+    "salvage": "打捞",
     "mobile defense": "移动防御",
-    "mobiledefense": "移动防御", "rescue": "救援", "spy": "间谍",
-    "sabotage": "破坏", "excavation": "挖掘", "disruption": "中断",
-    "assassination": "刺杀", "hijack": "劫持", "assault": "强袭",
-    "skirmish": "遭遇战", "rush": "冲刺", "void flood": "虚空洪流",
-    "voidflood": "虚空洪流", "void cascade": "虚空覆涌",
+    "mobiledefense": "移动防御",
+    "rescue": "救援",
+    "spy": "间谍",
+    "sabotage": "破坏",
+    "excavation": "挖掘",
+    "disruption": "中断",
+    "assassination": "刺杀",
+    "hijack": "劫持",
+    "assault": "强袭",
+    "skirmish": "遭遇战",
+    "rush": "冲刺",
+    "void flood": "虚空洪流",
+    "voidflood": "虚空洪流",
+    "void cascade": "虚空覆涌",
     "voidcascade": "虚空覆涌",
-    "orphix": "奥菲克斯", "alchemy": "元素转换", "mirror defense": "镜像防御",
-    "eidelonhunt": "夜灵狩猎", "hunt": "狩猎",
+    "orphix": "奥菲克斯",
+    "alchemy": "元素转换",
+    "mirror defense": "镜像防御",
+    "eidelonhunt": "夜灵狩猎",
+    "hunt": "狩猎",
     # ↓ DE ExportMissionTypes 有、早期手写表漏掉的类型（补全，避免展示/筛选落空）
-    "legacyte harvest": "传承种收割", "ascension": "扬升", "hive": "清巢",
-    "free roam": "自由漫游", "conclave": "武形秘仪",
-    "void armageddon": "虚空决战", "descent": "沉沦之地",
-    "endless duviri": "无尽回廊", "sanctuary onslaught": "圣殿突袭",
-    "offering defense": "祈运坛防御", "vaults": "衰退室",
-    "dark sector": "黑暗地带战争", "rathuum": "竞技场",
-    "junction": "星际航道结合点", "pvpve": "对战", "tau war": "佩里塔叛乱",
-    "paint flood": "Follie 的狩猎", "unknown": "未知",
+    "legacyte harvest": "传承种收割",
+    "ascension": "扬升",
+    "hive": "清巢",
+    "free roam": "自由漫游",
+    "conclave": "武形秘仪",
+    "void armageddon": "虚空决战",
+    "descent": "沉沦之地",
+    "endless duviri": "无尽回廊",
+    "sanctuary onslaught": "圣殿突袭",
+    "offering defense": "祈运坛防御",
+    "vaults": "衰退室",
+    "dark sector": "黑暗地带战争",
+    "rathuum": "竞技场",
+    "junction": "星际航道结合点",
+    "pvpve": "对战",
+    "tau war": "佩里塔叛乱",
+    "paint flood": "Follie 的狩猎",
+    "unknown": "未知",
 }
 _CN_TO_MISSION: dict[str, str] = {}
 for _en, _cn in MISSION_CN.items():
@@ -744,20 +946,51 @@ for _en, _cn in MISSION_CN.items():
 # 旧手写译名 / 社区叫法：仍然接受，用户按老习惯输入也能筛到
 # （`MT_PURIFY` 的正名已按官方订正为「INFESTED 资源回收」，旧的「感染打捞」留作别名 ——
 #   2026-09-28 §六：订正后 `MISSION_CN` 与官方任务类型表**零冲突**，此前仅此 1 条冲突。）
-_CN_TO_MISSION.update({
-    "感染打捞": "infested salvage",
-    "营救": "rescue", "炼金": "alchemy", "虚空级联": "void cascade",
-    "追猎": "pursuit", "突袭": "assault",
-})
+_CN_TO_MISSION.update(
+    {
+        "感染打捞": "infested salvage",
+        "营救": "rescue",
+        "炼金": "alchemy",
+        "虚空级联": "void cascade",
+        "追猎": "pursuit",
+        "突袭": "assault",
+    }
+)
 
 # 遗物纪元中文名（DE 官方简中，见 /Lotus/Language/Relics/Era_*）
 # ⚠️ Omnia（全能）与 Requiem（安魂）是两个不同的纪元，绝不能都译成「安魂」——
 #    旧实现把 Omnia 也写成「安魂」，于是扎里曼/联结生存的裂隙全部显示成安魂裂缝。
-TIER_CN = {"Lith": "古纪", "Meso": "前纪", "Neo": "中纪", "Axi": "后纪",
-           "Requiem": "安魂", "Omnia": "全能", "Vanguard": "先锋",
-           "古纪": "Lith", "前纪": "Meso", "中纪": "Neo", "后纪": "Axi",
-           "安魂": "Requiem", "全能": "Omnia", "先锋": "Vanguard"}
+TIER_CN = {
+    "Lith": "古纪",
+    "Meso": "前纪",
+    "Neo": "中纪",
+    "Axi": "后纪",
+    "Requiem": "安魂",
+    "Omnia": "全能",
+    "Vanguard": "先锋",
+    "古纪": "Lith",
+    "前纪": "Meso",
+    "中纪": "Neo",
+    "后纪": "Axi",
+    "安魂": "Requiem",
+    "全能": "Omnia",
+    "先锋": "Vanguard",
+}
 _TIER_KEYS = ("Lith", "Meso", "Neo", "Axi", "Requiem", "Omnia")
+
+# ★ 2026-10-03：裂隙档位的 T 编号别名（DE 官方 VoidT1..T6 的编号）。
+#   ★ **不要并入 TIER_CN** —— TIER_CN 被「遗物」等共用（relic.py 明说以它作
+#     真源），塞进去会串味。T 别名只在裂隙筛选侧生效（经 FISSURE_TIER_WORDS
+#     过滤）。映射与 core/data/de/fissureModifiers.json（VoidT1..T6）及
+#     core/de_worldstate.py::fissure_tier() 完全一致（单一真源，勿另写）。
+TIER_T_ALIAS: dict[str, str] = {
+    "t1": "Lith",
+    "t2": "Meso",
+    "t3": "Neo",
+    "t4": "Axi",
+    "t5": "Requiem",
+    "t6": "Omnia",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -772,10 +1005,30 @@ FISSURE_HARD_WORDS = ("钢铁", "钢路")
 FISSURE_STORM_WORDS = ("九重天", "empyrean")
 FISSURE_NORMAL_WORD = "普通"
 FISSURE_VOID_WORD = "虚空"
-FISSURE_TIER_WORDS = ("古纪", "前纪", "中纪", "后纪")
-FISSURE_MODIFIER_WORDS = (FISSURE_HARD_WORDS + FISSURE_STORM_WORDS
-                          + (FISSURE_NORMAL_WORD, FISSURE_VOID_WORD)
-                          + FISSURE_TIER_WORDS)
+# ★ 2026-10-03：档位词表扩为 古纪/前纪/中纪/后纪 + 安魂 + 全能 + T1–T6。
+#   此前安魂/全能不在表里 ⇒ 退化成节点子串、永不命中（实测坑 2）；T1..T6
+#   同理（坑 1）。FISSURE_MODIFIER_WORDS 是它的派生（dun_rule_hint 自动
+#   跟着走）——**同源一处，别各写一份**。小写 t1..t6 供 p.lower() 匹配。
+FISSURE_TIER_WORDS = (
+    "古纪",
+    "前纪",
+    "中纪",
+    "后纪",
+    "安魂",
+    "全能",
+    "t1",
+    "t2",
+    "t3",
+    "t4",
+    "t5",
+    "t6",
+)
+FISSURE_MODIFIER_WORDS = (
+    FISSURE_HARD_WORDS
+    + FISSURE_STORM_WORDS
+    + (FISSURE_NORMAL_WORD, FISSURE_VOID_WORD)
+    + FISSURE_TIER_WORDS
+)
 
 
 @dataclass
@@ -816,9 +1069,12 @@ class FissureFilter:
             return False
         # 虚空星系：节点中文名带「（虚空）」后缀（_node_name 拼星球名），
         # 兼容 DE 英文键含 void 的写法
-        if g.get("void") and "虚空" not in (f.get("node") or "") \
-                and "void" not in (f.get("nodeKey") or "").lower() \
-                and "void" not in (f.get("missionKey") or "").lower():
+        if (
+            g.get("void")
+            and "虚空" not in (f.get("node") or "")
+            and "void" not in (f.get("nodeKey") or "").lower()
+            and "void" not in (f.get("missionKey") or "").lower()
+        ):
             return False
         if g.get("missions") and not (FissureFilter._mission_keys(f) & g["missions"]):
             return False
@@ -841,13 +1097,29 @@ class FissureFilter:
                 seg.append("九重天")
             if g.get("void"):
                 seg.append("虚空")
-            if not g.get("hard") and not g.get("storm") and not g.get("void") \
-                    and (g.get("missions") or g.get("tiers")):
+            if (
+                not g.get("hard")
+                and not g.get("storm")
+                and not g.get("void")
+                and (g.get("missions") or g.get("tiers"))
+            ):
                 seg.append("普通")
             if g.get("missions"):
                 seg.append("/".join(MISSION_CN.get(m, m) for m in sorted(g["missions"])))
             if g.get("tiers"):
-                seg.append("/".join(TIER_CN.get(t, t) for t in g["tiers"]))
+                # ★ 2026-10-03：档位统一显示「中文名（Tn）」（古纪（T1）…全能（T6）），
+                #   编号顺序与 formatters._TIER_ORDER（Lith=0…Omnia=5）对齐；此处用
+                #   本地有序元组推编号，避免 parser ↔ formatters 循环 import。
+                seg.append(
+                    "/".join(
+                        (
+                            f"{TIER_CN.get(t, t)}（T{_TIER_ORDER_LOCAL.index(t) + 1}）"
+                            if t in _TIER_ORDER_LOCAL
+                            else TIER_CN.get(t, t)
+                        )
+                        for t in g["tiers"]
+                    )
+                )
             if g.get("substr"):
                 seg.append(g["substr"])
             parts.append("".join(seg) or "全部")
@@ -864,10 +1136,19 @@ def parse_fissure_filter(text: str) -> FissureFilter:
         g: dict = {}
         words = re.split(r"\s+", blob)
         merged = "".join(words)
-        # 纪元层级
+        # 全角/大小写归一：Ｔ５→t5、１→1（中文词不受影响）——T5 / t5 / Ｔ５ 等价。
+        norm = unicodedata.normalize("NFKC", merged)
+        low = norm.lower()
+        # 纪元层级：中文档位词按子串匹配；T 别名（t1..t6）要求词边界
+        # （「T5x / t55 / T05」一律不认 —— 走 fissure_tier_hint 提示，不猜）。
         tiers = set()
-        for cn, en in TIER_CN.items():
-            if cn in merged and cn in FISSURE_TIER_WORDS:
+        for cn, en in {**TIER_CN, **TIER_T_ALIAS}.items():
+            if cn not in FISSURE_TIER_WORDS:
+                continue
+            if cn in TIER_T_ALIAS:
+                if re.search(rf"(?<![a-z0-9]){cn}(?![0-9a-z])", low):
+                    tiers.add(en)
+            elif cn in merged:
                 tiers.add(en)
         if tiers:
             g["tiers"] = tiers
@@ -880,8 +1161,10 @@ def parse_fissure_filter(text: str) -> FissureFilter:
             g["storm"] = True
         elif FISSURE_NORMAL_WORD in merged:
             g["storm"] = False
-        # 任务类型：逐个 CN 词匹配后剔除，剩余部分作为节点/星球子串
-        rest = merged
+        # 任务类型：逐个 CN 词匹配后剔除，剩余部分作为节点/星球子串。
+        # rest 从**归一化文本**起算：T 别名是全角/大小写无关的（rest 清理
+        # 必须一并剔除 T 别名，否则 T5 残留成 len≥2 的节点子串 —— 实测坑 3）。
+        rest = norm
         missions = set()
         for cn, en in sorted(_CN_TO_MISSION.items(), key=lambda kv: -len(kv[0])):
             if cn in rest:
@@ -890,7 +1173,8 @@ def parse_fissure_filter(text: str) -> FissureFilter:
         for kw in FISSURE_HARD_WORDS + FISSURE_STORM_WORDS + (FISSURE_NORMAL_WORD,):
             rest = rest.replace(kw, "")
         for cn in FISSURE_TIER_WORDS:
-            rest = rest.replace(cn, "")
+            # 大小写不敏感剔除（T5/t5 都清掉；中文词不受影响）
+            rest = re.sub(re.escape(cn), "", rest, flags=re.IGNORECASE)
         # 地区修饰：「虚空」= 只收虚空星系节点（2026-09-14 修「蹲 虚空捕获
         # 却推了木星捕获」——旧版把「虚空」当纯修饰词剔除，等于没写）。
         # 必须在任务名剔除**之后**再判定：虚空覆涌/虚空洪流这类任务名本身
@@ -908,6 +1192,52 @@ def parse_fissure_filter(text: str) -> FissureFilter:
     return flt
 
 
+# T1–T6 展示编号顺序（与 formatters._TIER_ORDER 的 Lith=0…Omnia=5 对齐；
+# 本地元组避免 parser ↔ formatters 循环 import —— 两处语义必须一致）。
+_TIER_ORDER_LOCAL = ("Lith", "Meso", "Neo", "Axi", "Requiem", "Omnia")
+_TIER_RANGE_TEXT = "T1古纪 / T2前纪 / T3中纪 / T4后纪 / T5安魂 / T6全能"
+
+
+def contains_fissure_tier(text: str) -> bool:
+    """文本是否含裂隙档位词（T1–T6 别名 / 古纪…全能）。
+
+    ★ 2026-10-03（用户拍板）：**档位词本身就含裂隙语义** —— 「蹲」用它在
+    用户漏写类型词时自动判定为裂隙（「蹲 钢铁t5歼灭」直接生效）。
+    ⚠ 只认**档位词**（裂隙专属词汇）；钢铁/虚空/地点词一律不推断 ——
+    不重蹈 2026-09-14「地点词被静默当裂隙筛选」的覆辙。
+    """
+    low = unicodedata.normalize("NFKC", text or "").lower()
+    return any(w in low for w in FISSURE_TIER_WORDS)
+
+
+def fissure_tier_hint(text_or_parts) -> str:
+    """裂隙档位写法提示（T 越界编号 / 孤立的 t）；无需提示返回空串。
+
+    合法：T1–T6（大小写与全角均可，与中文档位词等价）。以下一律**明确提示**
+    （铁律 A：不静默）：T0 / T7 / T9、T05、t55、T5x、5T、孤立的 t。
+    与 :func:`dun_rule_hint` 同风格 —— **只提示、不改解析语义**。
+    """
+    if isinstance(text_or_parts, str):
+        parts = [text_or_parts]
+    else:
+        parts = [str(p) for p in (text_or_parts or []) if p]
+    low = " ".join(unicodedata.normalize("NFKC", p).lower() for p in parts)
+    bad = False
+    for m in re.finditer(r"(?<![a-z0-9])t(\d+)", low):
+        if m.group(1) not in ("1", "2", "3", "4", "5", "6"):
+            bad = True
+            break
+    if not bad:
+        bad = bool(
+            re.search(r"(?<![a-z0-9])t(?![0-9a-z])", low)  # 孤立的 t（后面不跟数字）
+            or re.search(r"(?<![a-z0-9])t\d+[a-z]", low)  # T5x 这类
+            or re.search(r"\d+t(?![0-9a-z])", low)  # 5T 这类
+        )
+    if not bad:
+        return ""
+    return f"※ 裂隙档位只支持 T1–T6（{_TIER_RANGE_TEXT}）"
+
+
 def dun_rule_hint(parts: list[str]) -> str:
     """「蹲」筛选串的**空格陷阱**提示；无需提示时返回空串。
 
@@ -923,27 +1253,43 @@ def dun_rule_hint(parts: list[str]) -> str:
     parts = [p for p in parts if p and p.strip()]
     if len(parts) < 2:
         return ""
-    if not any(any(w in p.lower() for w in FISSURE_MODIFIER_WORDS)
-               for p in parts):
+    if not any(any(w in p.lower() for w in FISSURE_MODIFIER_WORDS) for p in parts):
         return ""
-    return ("※ 提示：多词=多条件取或；要合并请连写「" + "".join(parts)
-            + "」或加引号「\"" + " ".join(parts) + "\"」")
+    return (
+        "※ 提示：多词=多条件取或；要合并请连写「"
+        + "".join(parts)
+        + '」或加引号「"'
+        + " ".join(parts)
+        + '"」'
+    )
 
 
 # ---------------------------------------------------------------------------
 # 蹲：时长与免打扰时间窗
 # ---------------------------------------------------------------------------
 _DURATION_UNITS = {
-    "小时": 3600, "h": 3600,
-    "天": 86400, "日": 86400, "d": 86400,
-    "周": 604800, "星期": 604800, "w": 604800,
-    "月": 2592000, "yue": 2592000,
-    "年": 31536000, "y": 31536000,
+    "小时": 3600,
+    "h": 3600,
+    "天": 86400,
+    "日": 86400,
+    "d": 86400,
+    "周": 604800,
+    "星期": 604800,
+    "w": 604800,
+    "月": 2592000,
+    "yue": 2592000,
+    "年": 31536000,
+    "y": 31536000,
 }
 _DURATION_WORDS = {
-    "永久": -1, "长期": -1, "无限": -1,
-    "两周": 1209600, "半月": 1296000,
-    "一周": 604800, "一天": 86400, "今天": 86400,
+    "永久": -1,
+    "长期": -1,
+    "无限": -1,
+    "两周": 1209600,
+    "半月": 1296000,
+    "一周": 604800,
+    "一天": 86400,
+    "今天": 86400,
 }
 
 
@@ -967,10 +1313,10 @@ def parse_duration(text: str) -> Optional[int]:
 class TimeWindow:
     """免打扰/允许推送时间窗。空对象表示全天允许。"""
 
-    start: Optional[int] = None   # 小时 0-23
-    end: Optional[int] = None     # 小时 0-23
+    start: Optional[int] = None  # 小时 0-23
+    end: Optional[int] = None  # 小时 0-23
     days: Optional[set[int]] = None  # 星期集合（1=周一 ... 7=周日）
-    at_hour: Optional[int] = None    # 每天 HH 点推送
+    at_hour: Optional[int] = None  # 每天 HH 点推送
 
     @property
     def is_always(self) -> bool:

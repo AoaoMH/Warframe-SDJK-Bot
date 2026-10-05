@@ -6,6 +6,7 @@ steelpath / descendia / incursions；另迁 _valence_note（效价快照说明�
 消费者 _rotation_lines 仍留 main.py，经 self 跨 Mixin 调用）。
 子包纪律：不 import astrbot（事件对象鸭子类型）。
 """
+
 from __future__ import annotations
 
 from .. import formatters as fmt
@@ -21,13 +22,13 @@ class ProgressCommands:
         return Reply(title, lines, footer=fmt.fmt_platform_footer(platform))
 
     async def _h_deep(self, parsed, event, platform) -> Reply:
-        title, lines = fmt.fmt_archimedea(
-            await self.client.deep_archimedea(platform), "深层科研")
+        title, lines = fmt.fmt_archimedea(await self.client.deep_archimedea(platform), "深层科研")
         return Reply(title, lines, footer=fmt.fmt_platform_footer(platform))
 
     async def _h_temporal(self, parsed, event, platform) -> Reply:
         title, lines = fmt.fmt_archimedea(
-            await self.client.temporal_archimedea(platform), "时光科研")
+            await self.client.temporal_archimedea(platform), "时光科研"
+        )
         return Reply(title, lines, footer=fmt.fmt_platform_footer(platform))
 
     async def _h_steelpath(self, parsed, event, platform) -> Reply:
@@ -40,12 +41,22 @@ class ProgressCommands:
         title, lines = fmt.fmt_steel_essence_shop()
         return Reply(title, lines, footer=fmt.fmt_platform_footer(platform, "钢铁精华兑换"))
 
+    async def _h_slivershop(self, parsed, event, platform) -> Reply:
+        """碎银兑换 = Palladino 裂罅碎块商店（地球「钢铁守望」）。
+
+        2026-10-03 取证：全表常驻、无轮换库存；每周限购周一 00:00 UTC 重置。
+        数据 core/data/de/palladino_shop.json，中文名 DE 官方 language 表。
+        """
+        title, lines = fmt.fmt_sliver_shop()
+        return Reply(title, lines, footer=fmt.fmt_platform_footer(platform, "裂罅碎块兑换"))
+
     # 仲裁筛选关键词 -> arbi.wf.wiki 的 missionNameZh 规范值
     # （该站中文表把 Infested Salvage 写作「INFESTED 资源回收」，比对前需去前缀）
     @staticmethod
     def _valence_note(data: dict, window_start) -> str:
         """元素加成快照的说明行（快照落在上一轮时明确标「可能已变」）。"""
         from datetime import datetime, timezone
+
         raw = data.get("valence_snapshot") or ""
         if not raw:
             return ""
@@ -58,8 +69,11 @@ class ProgressCommands:
         stale = snap < window_start
         when = snap.astimezone(timezone.utc).strftime("%m-%d %H:%M")
         flag = "（上一轮快照，数值可能已变）" if stale else "（本轮快照）"
-        return (f"※ 元素与加成为 {when} UTC 快照{flag}：wiki「Reset」页玩家上报值"
-                f"（无官方 API，换轮后需人工刷新），以游戏内商店为准")
+        return (
+            f"※ 元素与加成为 {when} UTC 快照{flag}：wiki「Reset」页玩家上报值"
+            f"（无官方 API，换轮后需人工刷新），以游戏内商店为准"
+        )
+
     async def _h_descendia(self, parsed, event, platform) -> Reply:
         data = await self.client.descendia(platform)
         title, lines = fmt.fmt_descendia(data)

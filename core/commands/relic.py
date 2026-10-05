@@ -5,6 +5,7 @@
 统一真源封装）与 RELIC_USAGE（用法串唯一真源）随迁。
 子包纪律：不 import astrbot（事件对象鸭子类型）。
 """
+
 from __future__ import annotations
 
 import json
@@ -12,9 +13,29 @@ import re
 
 from .. import drops as drops_db
 from .. import formatters as fmt
+from .. import matching
 from ..logging_compat import logger
 from ..parser import TIER_CN, parse
 from .base import PLUGIN_DIR, Reply
+
+
+def _en_name_to_zh(q: str) -> str:
+    """英文物品/武器名 → 官方中文（复用双语表；C1，2026-10-03）。
+
+    混合写法也认：「afentis prime 蓝图」→「圣英 Prime 蓝图」（英文段查表、
+    中文段原样保留）。查不到返回空串（调用方保持原路径，不阻断）。
+    """
+    toks = (q or "").split()
+    for k in range(len(toks), 0, -1):
+        head = " ".join(toks[:k])
+        if any("\u4e00" <= c <= "\u9fff" for c in head):
+            continue  # 含中文的段不查英文侧（避免误换）
+        r = matching.bilingual_lookup(head, limit=1)
+        if r.get("hits"):
+            zh = r["hits"][0][1]
+            rest = " ".join(toks[k:])
+            return (zh + (" " + rest if rest else "")).strip()
+    return ""
 
 
 def _relic_tier_en() -> dict:
@@ -32,8 +53,11 @@ def _relic_tier_en() -> dict:
 
 # 遗物指令的用法串 —— **唯一真源**（2026-09-26 抽常量：原先空参数处与未命中处各写一份，必然漂移）。
 # 文案逐字保留自原实现；纯文本、<=3 行，不含卡片渲染（避开字体子集/豆腐块风险）。
-RELIC_USAGE = ("用法：遗物 后纪A2（查奖励）｜ 遗物 绝路 枪机（部件反查出处）｜"
-               " 遗物 出库（当前可掉落）｜ 遗物 入库（已入库、不可刷取）")
+RELIC_USAGE = (
+    "用法：遗物 后纪A2（查奖励）｜ 遗物 绝路 枪机（部件反查出处）｜"
+    " 遗物 出库（当前可掉落）｜ 遗物 入库（已入库、不可刷取）"
+)
+
 
 class RelicCommands:
     """Mixin：遗物 / 开核桃 handler（挂载于 main.WarframeSDJK）。"""
@@ -53,22 +77,24 @@ class RelicCommands:
 
     @staticmethod
     def _norm_relic(q: str) -> str:
-        """"后纪A2 / 先锋C1 / 安魂 I / Axi A2" -> "后纪 Axi A2" 简化归一。
+        """ "后纪A2 / 先锋C1 / 安魂 I / Axi A2" -> "后纪 Axi A2" 简化归一。
 
         ★ 档位表一律取 core/parser.TIER_CN（含 Omnia/Vanguard）——曾本地硬编 5 档，
         2026-09 新增「先锋」档后「遗物 先锋 C1」直接「未找到」（资料会话交接）；
         代号支持 字母+数字（A2/A 2）、罗马数字（I..IV）、词式（Eterna，安魂档）。
         """
         import re as _re
+
         zh2en = {k: v for k, v in TIER_CN.items() if not k.isascii()}
         q = _re.sub(r"\s+", " ", q.strip().replace("纪元", ""))
         era = next((k for k in zh2en if q.startswith(k)), None)
         if not era:
             return q
-        code = q[len(era):].strip()
+        code = q[len(era) :].strip()
         code = code.split()[0] if code else ""
-        m2 = (_re.match(r"^([A-Za-z])(\d{1,2})$", code)
-              or _re.match(r"^([A-Za-z])\s+(\d{1,2})$", code))
+        m2 = _re.match(r"^([A-Za-z])(\d{1,2})$", code) or _re.match(
+            r"^([A-Za-z])\s+(\d{1,2})$", code
+        )
         if m2:
             return f"{era} {zh2en[era]} {m2.group(1).upper()}{int(m2.group(2))}"
         if code and _re.fullmatch(r"[IVX]+", code, _re.I):
@@ -91,8 +117,7 @@ class RelicCommands:
         try:
             vault = await self.client.prime_vault(platform)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[sdjk] 阿耶商店数据取不到，"
-                           "本次按「不在售」处理：%s", exc)
+            logger.warning("[sdjk] 阿耶商店数据取不到，本次按「不在售」处理：%s", exc)
             return keys
         for it in vault.get("items") or []:
             if (it.get("kind") or "") != "relic":
@@ -139,8 +164,7 @@ class RelicCommands:
                 # （用户 2026-09-17：「列出一大堆重复星系没啥用阿」）。
                 # 单个遗物的奖励与出处仍用「遗物 名称」查；出库卡另附
                 # 「推荐刷取 / 特殊渠道」两行（见下面的 specials / farm_hints）。
-                row = {"cn": k, "tier_cn": m[0], "unvaulted": unvaulted,
-                       "varzia": en_key in varzia}
+                row = {"cn": k, "tier_cn": m[0], "unvaulted": unvaulted, "varzia": en_key in varzia}
                 (unv_rows if unvaulted else vaulted_rows).append(row)
 
             # 语义：**出库 = 从金库放出 = 当前可以掉落**（unvaulted）；
@@ -154,8 +178,7 @@ class RelicCommands:
                 title = "遗物入库（已入库、不可刷取）"
             else:  # "列表"
                 rows = unv_rows + vaulted_rows
-                title = (f"遗物列表：当前可掉落 {len(unv_rows)}，"
-                         f"已入库 {len(vaulted_rows)}")
+                title = f"遗物列表：当前可掉落 {len(unv_rows)}，已入库 {len(vaulted_rows)}"
 
             # 特殊获取渠道标记（用户要求：「有一部分遗物只要指定位置能获取，
             # 那种单独去标记」）—— 只在出库卡算：
@@ -173,20 +196,23 @@ class RelicCommands:
                     if len(m) < 3:
                         continue
                     why = drops_db.special_source(
-                        f"{tier_en.get(m[0], m[0].lower())} "
-                        f"{m[2].lower()} relic")
+                        f"{tier_en.get(m[0], m[0].lower())} {m[2].lower()} relic"
+                    )
                     if why:
                         specials[nm] = why
 
             title, lines = fmt.fmt_relic_by_tier(
-                rows, title, page=parsed.page,
+                rows,
+                title,
+                page=parsed.page,
                 # 列表按纪元分组并排展示，每页要装得下整个纪元；
                 # self.page_size（默认 12）是给逐条带详情的卡片用的，太碎。
                 # 每行 9 列后每页 90 个 ≈ 10 行，13 页降到 9 页。
                 page_size=max(90, self.page_size),
                 # 推荐刷取点只在出库卡给（已入库的刷不到）
                 farm_hints=drops_db.farm_hints() if q == "出库" else None,
-                specials=specials or None)
+                specials=specials or None,
+            )
             return Reply(title, lines, footer=fmt.fmt_platform_footer(platform))
         # ①-b 单档位词（「遗物 先锋」）→ 该档位遗物一览（复用列表卡渲染）。
         #     用户实测反馈：新档「先锋」不知道有哪些遗物，直接查档位词最自然。
@@ -206,28 +232,48 @@ class RelicCommands:
                 for k in _sub:
                     m = k.split()
                     en_key = f"{tier_en.get(m[0], m[0].lower())} {m[2].lower()}"
-                    rows.append({"cn": k, "tier_cn": m[0],
-                                 "unvaulted": en_key in all_uv,
-                                 "varzia": en_key in varzia})
+                    rows.append(
+                        {
+                            "cn": k,
+                            "tier_cn": m[0],
+                            "unvaulted": en_key in all_uv,
+                            "varzia": en_key in varzia,
+                        }
+                    )
                 title, lines = fmt.fmt_relic_by_tier(
-                    rows, f"遗物列表：{q.strip()}（{len(rows)} 把）",
-                    page=parsed.page, page_size=max(90, self.page_size))
+                    rows,
+                    f"遗物列表：{q.strip()}（{len(rows)} 把）",
+                    page=parsed.page,
+                    page_size=max(90, self.page_size),
+                )
                 return Reply(title, lines, footer=fmt.fmt_platform_footer(platform))
         # ② 部件优先：带空格或能直接命中部件表
         # 名称归一：去空格精确匹配；非 Prime 输入自动补 Prime 试一次（wiki 上架过的只有 Prime 系）
-        q_nospace = q.replace(" ", "")
-        inv_norm = {k.replace(" ", ""): k for k in inv}
-        cands = [q_nospace]
-        # 非 Prime 输入自动补 Prime：**把 Prime 插到每个位置都试一遍**。
+        # ★ C1（2026-10-03）：匹配一律走 matching.normalize_name（大小写/空格/
+        #   中点/全半角无关）——线上实证「部件 阿索代prime」因裸 replace(" ","")
+        #   大小写敏感而查不到（库里是「阿索代 Prime 蓝图」）。
+        q_raw = q  # 用户原输入（「未找到」回显用，勿被改写带走）
+        q_nospace = matching.normalize_name(q)
+        inv_norm = {matching.normalize_name(k): k for k in inv}
+        # ★ C1：英文名 → 中文名（「afentis prime 蓝图」⇒「圣英 Prime 蓝图」），
+        #   查不到不阻断（原路径继续）。
+        _zh_alt = _en_name_to_zh(q)
+        bases = [q_nospace]
+        if _zh_alt:
+            bases.insert(0, matching.normalize_name(_zh_alt))
+        cands = []
+        # 非 Prime 输入自动补 Prime：**把 prime 插到每个位置都试一遍**。
         # 旧实现只插在「第一个部件类型字（枪/机/托/蓝/图/弦/管）」之前，
         # 而武器名里本身就可能带这些字 —— 「席尔火枪枪管」会插成
         # 「席尔火Prime枪枪管」，永远查不到（用户真实输入就是不带 Prime 的）。
         # 代价只是几十次 dict 查询，从**靠后**的位置开始插（部件类型词
         # 一般在末尾：枪管/枪机/蓝图），先命中的更可能是正确切分。
-        if "prime" not in q_nospace.lower():
-            for _i in range(len(q_nospace) - 1, 0, -1):
-                cands.append(q_nospace[:_i] + "Prime" + q_nospace[_i:])
-        cands.append(q_nospace + "Prime")
+        for _b in bases:
+            cands.append(_b)
+            if "prime" not in _b:
+                for _i in range(len(_b) - 1, 0, -1):
+                    cands.append(_b[:_i] + "prime" + _b[_i:])
+            cands.append(_b + "prime")
         inv_key = next((inv_norm.get(c) for c in cands if inv_norm.get(c)), None)
         if inv_key is not None:
             q = inv_key
@@ -238,18 +284,27 @@ class RelicCommands:
             #   · 黑话键可能不带 p（「水晶甲」），而用户把 p/prime 跟在黑话后面
             #     （「水晶甲p 蓝图」）→ 拼装前剥掉 rest 前导的 p/prime；
             #   · 只在直接匹配失败后兜底，不改变既有命中路径。
+            #   ★ C1：两侧都用 normalize_name（大小写/空格无关）。
             _tbl = (getattr(self.client, "_aliases", None) or {}).get("wm_items") or {}
-            _lower = {k.replace(" ", "").lower(): k for k in inv}
+            _lower = {matching.normalize_name(k): k for k in inv}
             for _i in range(len(q_nospace) - 1, 0, -1):
                 _slug = _tbl.get(q_nospace[:_i].lower())
                 if not _slug:
                     continue
-                _rest = re.sub(r"^(?:prime|p)(?=[\u4e00-\u9fff])", "",
-                               q_nospace[_i:], flags=re.I)
+                _rest = re.sub(r"^(?:prime|p)(?=[\u4e00-\u9fff])", "", q_nospace[_i:], flags=re.I)
                 _en = re.sub(r"_set$", "", _slug).replace("_", " ").title()
-                q = _lower.get((_en + _rest).replace(" ", "").lower()) or q
+                q = _lower.get(matching.normalize_name(_en + _rest)) or q
                 if q in inv:
                     break
+        if (
+            q not in inv
+            and _zh_alt
+            and matching.normalize_name(q) != matching.normalize_name(_zh_alt)
+        ):
+            # ★ C1：英文名未直中 ⇒ 用解析出的中文名**接管后续路径**——
+            #   「部件 athodai」与「部件 阿索代 Prime」都给出同一份候选
+            #   （阿索代 Prime 蓝图/枪管/枪机）。
+            q = _zh_alt
         if q in inv:
             origins = inv[q]
             # 「能不能获取」三态：在掉落表 / 仅阿耶在售 / 已入库。
@@ -268,17 +323,17 @@ class RelicCommands:
                     state = "varzia"
                 else:
                     state = "vaulted"
-                rows.append({"relic": o.get("relic"), "rarity": o.get("rarity"),
-                             "state": state})
-            title, lines = fmt.fmt_relic_piece(
-                q, rows, farm_hints=drops_db.farm_hints())
+                rows.append({"relic": o.get("relic"), "rarity": o.get("rarity"), "state": state})
+            title, lines = fmt.fmt_relic_piece(q, rows, farm_hints=drops_db.farm_hints())
             return Reply(title, lines, footer=fmt.fmt_platform_footer(platform))
         # ② 归一化遗物名
         nq = self._norm_relic(q)
         hit = idx.get(nq) or idx.get(q)
         if not hit:
             # 模糊：任一槽位包含 q
-            cand = [r for r in idx if q.replace(" ", "") in r.replace(" ", "")]
+            # ★ C1：归一化包含（大小写/空格/中点无关）
+            _nq = matching.normalize_name(q)
+            cand = [r for r in idx if _nq in matching.normalize_name(r)]
             if len(cand) == 1:
                 hit = idx[cand[0]]
                 nq = cand[0]
@@ -320,21 +375,26 @@ class RelicCommands:
                         lines.append("◆ 该遗物已入库，当前不可刷取")
             return Reply(title, lines, footer=fmt.fmt_platform_footer(platform))
         # ③ 视为部件名模糊（词序无关：把 q 的 token 任意拼接匹配）
-        qn = q.replace(" ", "")
-        fz = [k for k in inv if qn in k.replace(" ", "")]
+        #   ★ C1：两侧归一化（大小写/空格/中点无关）——「阿索代prime」曾因
+        #   裸 replace(" ","") 大小写敏感而在此静默落空。
+        qn = matching.normalize_name(q)
+        fz = [k for k in inv if qn in matching.normalize_name(k)]
         # 词序反转：绝路枪机 -> 枪机绝路
         if not fz:
-            fz = [k for k in inv
-                  if "".join(sorted(qn)) == "".join(sorted(k.replace(" ", "")[:len(qn)]))]
+            fz = [
+                k
+                for k in inv
+                if "".join(sorted(qn)) == "".join(sorted(matching.normalize_name(k)[: len(qn)]))
+            ]
         fz = list(dict.fromkeys(fz))[:6]
         if len(fz) == 1:
             parsed2 = parse(f"遗物 {fz[0]}")
             parsed2.command = "relic"
             return await self._h_relic(parsed2, event, platform)
-        tip = f"未找到「{q}」。"
+        tip = f"未找到「{q_raw}」。"
         if fz:
             tip += f"你是不是想找：{'、'.join(fz[:3])}"
-        tip += "\n" + RELIC_USAGE          # 顺序固定：未找到 → 你是不是想找 → 用法
+        tip += "\n" + RELIC_USAGE  # 顺序固定：未找到 → 你是不是想找 → 用法
         return Reply(raw_text=tip)
 
     async def _h_parts(self, parsed, event, platform) -> Reply:
@@ -353,16 +413,25 @@ class RelicCommands:
         price = next((t for t in toks if t in ("低价", "高价")), "")
         fissures = await self.client.fissures(platform)
         from datetime import datetime, timezone
+
         now = datetime.now(timezone.utc)
-        act = [f for f in fissures
-               if fmt.parse_iso(f.get("expiry", "")) and
-               fmt.parse_iso(f["expiry"]) > now]
+        act = [
+            f
+            for f in fissures
+            if fmt.parse_iso(f.get("expiry", "")) and fmt.parse_iso(f["expiry"]) > now
+        ]
         unv = drops_db.unvaulted_relics()
 
         def tier_key(tier: str) -> str:
-            return {"Lith": "lith", "Meso": "meso", "Neo": "neo",
-                    "Axi": "axi", "Requiem": "requiem",
-                    "Omnia": "omnia", "Vanguard": "vanguard"}.get(tier, "")
+            return {
+                "Lith": "lith",
+                "Meso": "meso",
+                "Neo": "neo",
+                "Axi": "axi",
+                "Requiem": "requiem",
+                "Omnia": "omnia",
+                "Vanguard": "vanguard",
+            }.get(tier, "")
 
         tier_unvaulted: dict[str, int] = {}
         for k, cn in unv.items():
@@ -383,24 +452,31 @@ class RelicCommands:
                 kind.append("钢铁")
             if f.get("isStorm"):
                 kind.append("九重天")
-            rows.append({"node": f.get("node", "?"), "type": mt, "tier": tier,
-                         "tier_cn": fmt.tier_cn(tier) if tier and tier != "?" else "?",
-                         "unv": cnt, "quick": mt in QUICK, "kind": "/".join(kind),
-                         "faction": fmt._fissure_faction(f),
-                         "expiry": f.get("expiry", "")})
+            rows.append(
+                {
+                    "node": f.get("node", "?"),
+                    "type": mt,
+                    "tier": tier,
+                    "tier_cn": fmt.tier_cn(tier) if tier and tier != "?" else "?",
+                    "unv": cnt,
+                    "quick": mt in QUICK,
+                    "kind": "/".join(kind),
+                    "faction": fmt._fissure_faction(f),
+                    "expiry": f.get("expiry", ""),
+                }
+            )
         if quick_only:
             rows = [r for r in rows if r["quick"]]
         if state == "未入库":
             rows = [r for r in rows if r["unv"] > 0]
         elif state == "已入库":
             rows = [r for r in rows if r["unv"] == 0]
-        rows.sort(key=lambda r: (fmt._TIER_ORDER.get(r["tier"], 99),
-                                 not r["quick"], -r["unv"]))
+        rows.sort(key=lambda r: (fmt._TIER_ORDER.get(r["tier"], 99), not r["quick"], -r["unv"]))
         if price:
             rows.sort(key=lambda r: r["unv"], reverse=(price == "高价"))
         # 不翻页：全部场次放同一张卡（用户要求「那几页内容都放一张截图上」）。
         total = len(rows)
-        chunk = rows[:fmt._ALL_ROWS_CAP]
+        chunk = rows[: fmt._ALL_ROWS_CAP]
         lines = []
         for r in chunk:
             tag = f"[{r['tier_cn']}]"
@@ -420,8 +496,10 @@ class RelicCommands:
             lines.append(f"{line} · 剩{fmt.countdown(r['expiry'])}")
         if not lines:
             lines = ["当前条件下没有可开的裂隙"]
-        lines.append("※ 按纪元排序（古纪→前纪→中纪→后纪→安魂→全能），"
-                     "「可掉落 N 种」= 该纪元当前仍在掉落池的遗物数")
+        lines.append(
+            "※ 按纪元排序（古纪→前纪→中纪→后纪→安魂→全能），"
+            "「可掉落 N 种」= 该纪元当前仍在掉落池的遗物数"
+        )
         lines.append("※ 「速刷」= 捕获 / 歼灭 / 破坏 / 救援 / 间谍 这类快节奏任务")
         if total > len(chunk):
             lines.append(f"※ 共 {total} 场，本卡只列前 {len(chunk)} 场（按上面口径排序）")

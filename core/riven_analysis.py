@@ -16,19 +16,30 @@ Attribute Value Formula / Base Values 两节）：
 基值表按武器类别（Rifle/Shotgun/Pistol/Archgun/Melee）各一列。数据为静态
 游戏机制（DE 上次改动这些基值是很久以前），不存在过期问题。
 """
+
 from __future__ import annotations
 
 import re
 from typing import Optional
 
 # 武器类别（WM riven weapons 的 group/rivenType 归一化）→ 基值表列名
-_CLASS_KEYS = {"rifle": "rifle", "shotgun": "shotgun", "pistol": "pistol",
-               "archgun": "archgun", "melee": "melee", "zaw": "melee",
-               "kitgun": "pistol"}
+_CLASS_KEYS = {
+    "rifle": "rifle",
+    "shotgun": "shotgun",
+    "pistol": "pistol",
+    "archgun": "archgun",
+    "melee": "melee",
+    "zaw": "melee",
+    "kitgun": "pistol",
+}
 
 # 词条数系数表：{(正词条数, 负词条数): (正系数, 负系数 magnitude)}
-FACTOR = {(2, 0): (0.99, None), (3, 0): (0.75, None),
-          (2, 1): (1.2375, 0.495), (3, 1): (0.9375, 0.75)}
+FACTOR = {
+    (2, 0): (0.99, None),
+    (3, 0): (0.75, None),
+    (2, 1): (1.2375, 0.495),
+    (3, 1): (0.9375, 0.75),
+}
 
 # 属性基值表（wiki Base Values 表的静态转录）。
 # 键 = 插件标准词条 id（与 parser.RIVEN_STAT_ZH 同一套）；
@@ -40,7 +51,7 @@ _BASE: dict[str, tuple] = {
     "crit_chance": (149.99, 90, 149.99, 99.9, 180),
     "crit_damage": (120, 90, 90, 80.1, 90),
     "multishot": (90, 119.7, 119.7, 60.3, None),
-    "fire_rate": (60.03, 90, 74.7, 60.03, 54.9),   # 近战即攻速
+    "fire_rate": (60.03, 90, 74.7, 60.03, 54.9),  # 近战即攻速
     "attack_speed": (60.03, 90, 74.7, 60.03, 54.9),
     "status_chance": (90, 90, 90, 60.3, 90),
     "status_duration": (99.99, 99.99, 99.99, 99.99, 99.99),
@@ -48,7 +59,15 @@ _BASE: dict[str, tuple] = {
     "initial_combo": (None, None, None, None, 24.5),
     "combo_duration": (None, None, None, None, 8.1),
     "heavy_attack_efficiency": (None, None, None, None, 73.44),
-    "combo_efficiency": (None, None, None, None, 58.77),
+    # ★ 2026-10-02 补录（用户提供官方 wiki「Riven Mods」基值表整页存档核对）：
+    #   同一 combo 家族的两侧 —— 表后 Legend 注明「¹ 仅正向（永不作为负面）」
+    #   「³ 仅负向（永不作为正面）」，两行近战基值即下列两项：
+    #     Additional Combo Count Chance¹ | Laci/Nus | 近战 58.77%
+    #     Chance to Gain Combo Count³   | –/–     | 近战 104.85%
+    #   反算自洽（报障卡 海波单剑 3+1：近战伤害 231.2/暴伤 128.8/滑暴 130.2
+    #   反推 D≈1.39~1.43，58.77×1.41×0.9375×0.915=71.1 ✓ 命中卡面 +71.1%）。
+    "extra_combo_count": (None, None, None, None, 58.77),
+    "combo_gain_chance": (None, None, None, None, 104.85),
     "finisher_damage": (None, None, None, None, 119.7),
     "slide_crit": (None, None, None, None, 120),
     "slash_damage": (119.97, 119.97, 119.97, 90, 119.7),
@@ -68,17 +87,20 @@ _BASE: dict[str, tuple] = {
     "projectile_speed": (90, 90, 90, None, None),
     "punch_through": (2.7, 2.7, 2.7, 2.7, None),
     "reload_speed": (50, 50, 50, 99.9, None),
+    # 后坐力：幅度 90%（官方 EN 表写 90%、中文表带方向写 -90%）—— 效果方向
+    # 由 INVERTED_STATS 表达：卡面「+」= 增加后坐力 = 负面，区间按负档系数算。
     "recoil": (90, 90, 90, 90, None),
     "zoom": (59.99, None, 80.1, 59.99, None),
 }
 
 # 百分比词条（显示时补 %）；其余按原单位（米/秒/纯值）
-_PCT_IDS = set(_BASE) - {"punch_through", "range", "combo_duration",
-                         "initial_combo"}
+_PCT_IDS = set(_BASE) - {"punch_through", "range", "combo_duration", "initial_combo"}
 
 # 不在基值表（wiki 尚未给基值）、但单位同样按百分比显示的词条：
-# 不补进这个集合的话，「暂无基值数据」那行会漏掉 %，读起来像绝对值。
-_PCT_UNIT_ONLY = {"extra_combo_count", "combo_gain_chance"}
+# 不补进这个集合的话，「无官方基值」那行会漏掉 %，读起来像绝对值。
+# ★ 2026-10-02：原成员 extra_combo_count / combo_gain_chance 已补录基值
+#   （见 _BASE），本集合现为空 —— 机制保留，供将来 wiki 未收录的新词条使用。
+_PCT_UNIT_ONLY: set = set()
 
 
 _CLASS_IDX = {"rifle": 0, "shotgun": 1, "pistol": 2, "archgun": 3, "melee": 4}
@@ -103,13 +125,45 @@ def weapon_class(riven_type: str = "", group: str = "") -> Optional[str]:
     return "rifle"
 
 
+# ★ 2026-10-03 晚（用户同卡双态截图实证，推翻本日早间结论）：组合枪紫卡的
+#   基值列**不分模式一律手枪列** —— 墓指（主要）实卡（伤害 194.7/多重 103.5/
+#   弹匣 50.2）按手枪列×倾向 1.0 反推 U=0.95/0.92/1.07 全部落带，按步枪列
+#   反推 U=1.26/1.23 出带（不可能）。kitgun 在 DE 物品系统里 productCategory
+#   就是 Pistols；「主要形态用霰弹枪 MOD」说的是普通 MOD 槽，不约束紫卡基值。
+#   主/次形态只差**倾向值**（omega/primeOmega，按模式拆分行取）。早间按
+#   「霰弹/步枪列」部署的逐腔体映射由此回退（8721dfc 的回归部分）。
+_MODE_SUFFIX_RE = re.compile(r"[（(](主要|次要|大气|primary|secondary|atmosphere)[)）]\s*$", re.I)
+_MODE_ALIASES = {"主要": "primary", "次要": "secondary", "大气": "atmosphere"}
+
+
+def mode_of(name: str) -> Optional[str]:
+    """武器名（EN 或 ZH 显示名）尾部的模式后缀 → 英文模式词；无则 None。"""
+    m = _MODE_SUFFIX_RE.search((name or "").strip())
+    if not m:
+        return None
+    w = m.group(1).lower()
+    return _MODE_ALIASES.get(w, w)
+
+
+def kitgun_mode_class(name: str, base_cls: str, base_riven_type: str) -> str:
+    """kitgun 腔体的紫卡基值列：**不分模式一律手枪列**（见上，实卡实证）。
+
+    函数保留签名是因为调用方（riven.py 家族候选三元组）按候选传参；
+    非 kitgun 原样返回母行类别。
+    """
+    if (base_riven_type or "").lower() != "kitgun":
+        return base_cls
+    return "pistol"
+
+
 def factor_for(n_pos: int, n_neg: int) -> tuple[float, Optional[float]]:
     """词条数系数：(正词条数, 负词条数) → (正系数, 负系数 magnitude)。"""
     return FACTOR.get((n_pos, n_neg), (0.9375, 0.75))
 
 
-def stat_range(stat_id: str, cls: str, disposition: float,
-               n_pos: int, n_neg: int, *, negative: bool = False) -> tuple:
+def stat_range(
+    stat_id: str, cls: str, disposition: float, n_pos: int, n_neg: int, *, negative: bool = False
+) -> tuple:
     """单词条的取值区间 (min, max)。
 
     Args:
@@ -204,12 +258,14 @@ def display_tol(stat_id: str, value: float) -> float:
 
 def _stat_entries(stats_pos, stats_neg) -> list:
     """词条扁平化 → [(stat_id, value, is_negative)]（值一律为 magnitude）。"""
-    return ([(sid, float(v), False) for sid, v in (stats_pos or [])]
-            + [(sid, float(v), True) for sid, v in (stats_neg or [])])
+    return [(sid, float(v), False) for sid, v in (stats_pos or [])] + [
+        (sid, float(v), True) for sid, v in (stats_neg or [])
+    ]
 
 
-def _fit_dev(entries, cls: str, pos_f: float, neg_f: Optional[float],
-             disp: float, tol_fn) -> Optional[float]:
+def _fit_dev(
+    entries, cls: str, pos_f: float, neg_f: Optional[float], disp: float, tol_fn
+) -> Optional[float]:
     """候选倾向能否解释全部词条：能则返回最大 |U-1|（越小越居中），否则 None。
 
     Args:
@@ -267,17 +323,17 @@ def disposition_interval(stats_pos, stats_neg, cls, *, tol_fn=None) -> tuple:
     return (round(lo, 4), round(hi, 4))
 
 
-def disp_feasible(stats_pos, stats_neg, cls, disp: float,
-                  *, tol_fn=None) -> bool:
+def disp_feasible(stats_pos, stats_neg, cls, disp: float, *, tol_fn=None) -> bool:
     """给定倾向 disp，判断卡面数值是否落在其 ±10% 区间内（全词条都要过）。"""
     tol_fn = tol_fn or display_tol
     pos_f, neg_f = factor_for(len(stats_pos or []), len(stats_neg or []))
-    return _fit_dev(_stat_entries(stats_pos, stats_neg), cls, pos_f, neg_f,
-                    float(disp), tol_fn) is not None
+    return (
+        _fit_dev(_stat_entries(stats_pos, stats_neg), cls, pos_f, neg_f, float(disp), tol_fn)
+        is not None
+    )
 
 
-def match_disposition(stats_pos, stats_neg, cls, candidates,
-                      *, tol_fn=None) -> list:
+def match_disposition(stats_pos, stats_neg, cls, candidates, *, tol_fn=None) -> list:
     """在候选 [(名称, 倾向)] 中筛出与卡面数值吻合的项（保持原顺序）。
 
     变体名不在截图里，但数值一定落在某个倾向的 ±10% 区间内；家族内
@@ -294,16 +350,73 @@ def match_disposition(stats_pos, stats_neg, cls, candidates,
     entries = _stat_entries(stats_pos, stats_neg)
     pos_f, neg_f = factor_for(len(stats_pos or []), len(stats_neg or []))
     out = []
-    for name, d in (candidates or []):
+    for cand in candidates or []:
+        name, d = cand[0], cand[1]
+        # ★ 2026-10-03：候选可带自身基值列（kitgun 主要形态=霰弹/步枪列，
+        #   与母行的手枪列不同）—— 三元组 (名称, 倾向, 类别)；
+        #   二元组沿用整体 cls（向后兼容）。
+        cand_cls = cand[2] if len(cand) > 2 else cls
         try:
             d = float(d)
         except (TypeError, ValueError):
             continue
         if d <= 0:
             continue
-        if _fit_dev(entries, cls, pos_f, neg_f, d, tol_fn) is not None:
+        if _fit_dev(entries, cand_cls, pos_f, neg_f, d, tol_fn) is not None:
             out.append((name, d))
     return out
+
+
+NEAR_MISS_MAX = 0.15
+
+
+def candidate_scores(stats_pos, stats_neg, cls, candidates) -> list:
+    """★ 2026-10-03 最近邻判据：给每个候选倾向打「最大相对偏差」分。
+
+    对候选 (名称, D)：``mid_i = 基值_i × D × 系数_i``（即 `stat_range`
+    区间的中点，复用现成公式）、``U_i = v_i / mid_i``（卷轴系数，理论
+    ∈ [0.9, 1.1]），``score = max_i |U_i − 1|`` —— 越小越像该候选。
+
+    为什么需要它（取证 output/取证-ZCode-组合枪倾向与判据定标-20261003.md
+    §五/§六）：严格区间判据（lo ≤ v ≤ hi）是**硬边界**，组合枪双模式
+    「wiki 与实机差 1%~5%」的腔体级残差会把只差 1% 的真候选判成不吻合
+    （实例：捕月主要 1.1 的多重/切割各差 0.7%/1.1% ⇒ 误报「老卡」）；
+    最近邻只比较**候选之间的相对远近**，对绝对偏差免疫。分档：
+    score ≤ ~0.10 的候选本就落在严格区间内（`match_disposition` 会先接住，
+    与现行判据等价）；0.10 < score ≤ `NEAR_MISS_MAX`（0.15）判该候选但
+    卡面标注残差；> 0.15 不判（老卡/识别异常）。
+
+    无可用基值的词条跳过；一条可用基值都没有的候选不计入。
+
+    Returns:
+        [(名称, 倾向, score), ...] 按 score 升序；空候选/全无基值返回 []。
+    """
+    n_pos, n_neg = len(stats_pos or []), len(stats_neg or [])
+    out = []
+    for cand in candidates or []:
+        name, d = cand[0], cand[1]
+        # ★ 2026-10-03：三元组候选自带基值列（kitgun 主要形态逐腔体霰弹/
+        #   步枪列，与母行手枪列不同）；二元组沿用整体 cls（向后兼容）。
+        cand_cls = cand[2] if len(cand) > 2 else cls
+        try:
+            d = float(d)
+        except (TypeError, ValueError):
+            continue
+        if d <= 0:
+            continue
+        worst, used = 0.0, 0
+        for sid, v, neg in _stat_entries(stats_pos, stats_neg):
+            lo, hi = stat_range(sid, cand_cls, d, n_pos, n_neg, negative=neg)
+            if lo is None or v <= 0:
+                continue
+            mid = (lo + hi) / 2
+            if mid <= 0:
+                continue
+            used += 1
+            worst = max(worst, abs(v / mid - 1))
+        if used:
+            out.append((name, d, worst))
+    return sorted(out, key=lambda x: x[2])
 
 
 # ---------------------------------------------------------------------------
@@ -316,20 +429,95 @@ def match_disposition(stats_pos, stats_neg, cls, candidates,
 # 现行分工：模型只负责**逐字照抄卡面文字行**（vision JSON 的 "lines"），
 # 归条 / 极性 / 计数由下面两条纯函数确定性决定 —— 只认行首带极性符号的行，
 # 卡面上的锁图标、行颜色（白色行）、右下角内融值、武器名与自命名一律不是词条。
-_POLARITY = {"+": False, "＋": False, "负": True,
-             "-": True, "−": True, "–": True, "—": True, "－": True}
+_POLARITY = {
+    "+": False,
+    "＋": False,
+    "负": True,
+    "-": True,
+    "−": True,
+    "–": True,
+    "—": True,
+    "－": True,
+}
+# ★ 极性**反转**词条（2026-10-02 用户报障「盗贼 Visi-fevacan」四行全 `+`，其中
+#   「+95.4% 武器后坐力」实为负面）：卡面符号与收益方向**相反** —— `+` 是负面、
+#   `-` 是正面。依据（双重证据）：
+#     ① WM 拍卖 1500 条 / 32 个词条字段实测（读 `item.attributes[].positive`）：
+#        **只有 recoil 反转** —— positive=true 的值为负（-9.0/-10.5/-16.1），
+#        positive=false 的值为正（+6.6/+5.9/+81.8）；其余 31 个词条（含 zoom）
+#        正号占比 1.00、负号占比 1.00 ⇒ 符号即极性。
+#     ② 区间反推（不依赖 WM）：盗贼 = Furis（手枪 倾向 1.35）× 3+1 系数下，
+#        95.4 按负词条 ∈ [82.01, 100.24] ✅、按正词条 [102.52, 125.3] ❌。
+#   ⚠️ 新增条目必须先有实测证据 + 配套断言，禁止凭「词条名像负面」推断。
+INVERTED_STATS = {"recoil"}
+
+
+def is_inverted(sid: str) -> bool:
+    """该词条的卡面符号是否与极性相反（`+` 实为负面、`-` 实为正面）。"""
+    return sid in INVERTED_STATS
+
+
+# ★ 「仅负向」词条（2026-10-02，官方 wiki「Riven Mods」基值表 Legend：³ 仅负向、
+#   永不作为正面）：「几率来获得连击数」（chance_to_gain_combo_count）——
+#   卡面只会出现「-X% 的几率来获得连击数」。
+#   锁定的理由：模型/OCR 丢符号是实测过的故障模式（曾把 ±43 后坐力都塞进正面槽），
+#   若把该词条读成正数放进正面，会给出一个现实中不存在的正向区间。
+#   （对应另一侧「额外连击数几率」= ¹ 仅正向，但正向本就是默认路径、不做强制。）
+NEGATIVE_ONLY = {"combo_gain_chance"}
+
+
+def is_negative_only(sid: str) -> bool:
+    """该词条是否只以负面形式出现（卡面恒为 `-`）。"""
+    return sid in NEGATIVE_ONLY
+
+
 # 词条行 = 极性符号开头（前面只允许装饰性符号：锁图标/圆点/括号/空白）。
 # 非装饰性字符（汉字、字母、数字）开头的行**不是**词条行 —— 武器名、自命名、
 # 内融值、卡面图例都靠这一条排除；而锁图标与行首那点装饰不能反而把真词条挤掉。
-_POL_RE = re.compile(r"^[^\w]*([+＋\-−–—－]|负)\s*(.*)$")
+# ★ 2026-10-01：`x` / `×` 也算极性前缀 —— 卡面「对派系伤害」是**乘数写法**
+#   （`x1.51 对 Infested 的伤害`），旧版整行被当「无极性符号」丢掉，3+1 的卡
+#   被读成 2+1（用户报障：+91.1%暴伤 / x1.51对Infested / +29.6初始连击 /
+#   -115.7%处决 只认了三行，区间系数从 0.9375 错成 1.2375，整卡数值全不吻合）。
+_POL_RE = re.compile(r"^[^\w]*([+＋\-−–—－]|负|[x×])\s*(.*)$", re.I)
 _NUM_RE = re.compile(r"\d+(?:[.,]\d+)?")
 # 全角 % 用 \uff05 转义写：它只在**输入匹配**里用到（永远不渲染到卡面），
 # 写成字面量会让「仓库语料」多出一个子集字体没有的字形（test_render_overflow
 # 的字库覆盖用例），逼着去重建字体子集。
 _BARE_NUM_RE = re.compile(r"^[\d.,]+\s*[%\uff05]?\s*[\w米秒]*$")
-# 乘数写法（卡面「x0.55 对 Corpus 的伤害」）：负词条 magnitude = (1−0.55)×100
-_MULT_RE = re.compile(r"[x×]\s*(\d+(?:[.,]\d+)?)|(\d+(?:[.,]\d+)?)\s*[x×]",
-                      re.I)
+# 乘数写法（卡面「x0.55 对 Corpus 的伤害」/「x1.51 对 Infested 的伤害」）
+_MULT_RE = re.compile(r"[x×]\s*(\d+(?:[.,]\d+)?)|(\d+(?:[.,]\d+)?)\s*[x×]", re.I)
+# ★ 括号后缀（「暴击几率（重击时 x2）」「射速（弓类武器效果加倍）」）是**卡面说明文案**，
+#   不是词条数值。搜乘数前必须先剥掉：2026-10-05 P0 —— 近战紫卡常见的
+#   「+211.4% 暴击几率（重击时 x2）」里那个 x2 命中 _MULT_RE，k=2.0 落在
+#   is_faction_mult 域内 ⇒ 被当派系乘数换算成 100.0，**211.4 静默丢失**
+#   （条数判据仍合法，整卡区间/评级全错）。同类：`+150.0% 连击持续时间 x2`。
+_PARA_RE = re.compile(r"[（(][^）)]*[）)]")
+# 乘数写法还原成 magnitude 的下限：对派系伤害基值 45 × 最小倾向 0.5 ×
+# 2正1负的 0.495 ≈ 11 ⇒ 小于 10 的数字一定不是 magnitude，而是「乘数漏写了
+# x / 只写了 1.51 或 0.55」，按乘数还原。
+_FACTION_MIN_MAG = 10.0
+# ★ 派系乘数（净伤害倍率）的合理取值域：卡面这行是 1 ± 基值45%×倾向×系数
+#   ×(0.9~1.1) ⇒ 理论 ≈0.42~1.95，实测样本 0.55/0.63/0.79/0.8/0.83/1.25/1.51。
+#   2026-10-02 线上实证：窄读会把词条图标抄成 `×`（「×59% 多重射击」），旧实现
+#   一律按乘数换算 ⇒ |1−59|×100 = **5800%**。出界（<0.35 或 >2.05）的 x/×
+#   不是乘数 —— 按普通数值读，不做乘法换算。
+_FACTION_MULT_LO = 0.35
+_FACTION_MULT_HI = 2.05
+
+
+def is_faction_mult(k: float) -> bool:
+    """该数值是否是卡面的派系乘数（净伤害倍率）写法。"""
+    return _FACTION_MULT_LO <= k <= _FACTION_MULT_HI
+
+
+def faction_mult_to_mag(k: float) -> tuple:
+    """卡面乘数 k → (magnitude, 是否负词条)。
+
+    卡面「对 X 的伤害」显示的是**净伤害倍率**：x1.51 = +51%（正词条）、
+    x0.55 = −45%（负词条）⇒ 极性由乘数本身决定（k>1 加伤、k<1 减伤），
+    不能一律按负词条收。
+    """
+    return (round(abs(1.0 - k) * 100, 2), k < 1.0)
 
 
 def merge_polarity_lines(lines) -> list:
@@ -343,7 +531,7 @@ def merge_polarity_lines(lines) -> list:
     """
     out: list = []
     buf = ""
-    for raw in (lines or []):
+    for raw in lines or []:
         t = str(raw or "").strip()
         if not t:
             continue
@@ -378,6 +566,16 @@ def _strip_name(body: str) -> str:
     return re.sub(r"[%\uff05x×\s　·、:：米秒]", "", name, flags=re.I)
 
 
+def _strip_parens(text: str) -> str:
+    """剥掉括号后缀（连同括号内容），只留主文案。
+
+    ★ 只用于**搜乘数**，不参与词条名解析：`_strip_name` 对
+    「211.4% 暴击几率（重击时 x2）」产出「暴击几率（重击时）」且照旧能 resolve 成
+    crit_chance（`_stat_id_from_name` 走子串包含），保持原样以免动到认名链路。
+    """
+    return _PARA_RE.sub(" ", text or "")
+
+
 def _dedup_pairs(pairs: list) -> list:
     seen: set = set()
     out: list = []
@@ -403,6 +601,9 @@ def parse_riven_lines(lines, resolve) -> tuple:
     只认**行首带极性符号**的行：锁图标、行颜色（白色行）、右下角内融值、
     武器名与自命名因为没有极性符号，天然被排除。名称与数值取**同一行**——
     不做跨行配对，跨行配对正是模型把两条词条的名称/数值交叉配错的来源。
+    ★ 2026-10-02 两处兼容：① 行首无极性符号时**先试整行乘数**（窄读会把
+    「x1.51 对 Infested 的伤害」抄成「对 X 的伤害 x1.51」，x 挪到行尾）；
+    ② 反转词条（recoil）按 `INVERTED_STATS` 翻转极性。
     """
     pos: list = []
     neg: list = []
@@ -410,6 +611,28 @@ def parse_riven_lines(lines, resolve) -> tuple:
     for raw in merge_polarity_lines(lines):
         m = _POL_RE.match(raw)
         if not m or not m.group(2).strip():
+            # ★ 2026-10-02 派系行兼容：行首无极性符号时先试整行乘数 ——
+            #   兼容 `x1.51 对 X 的伤害` 与 `对 X 的伤害 x1.51` 两种抄写
+            #   顺序（线上 16:18 实证：三条派系行因 x 在行尾被整条丢弃）。
+            # ★ 2026-10-05 P0：先剥括号后缀再搜乘数，且只认 damage_vs_* 词条 ——
+            #   否则「（重击时 x2）」的 x2 会把非派系词条的数值换成 100.0。
+            mm2 = _MULT_RE.search(_strip_parens(raw))
+            if mm2:
+                try:
+                    k2 = float((mm2.group(1) or mm2.group(2)).replace(",", "."))
+                except ValueError:
+                    notes.append(f"乘数读不出：{raw}")
+                    continue
+                name2 = _strip_name(raw)
+                sid2 = resolve(name2) if name2 else None
+                if sid2 and sid2.startswith("damage_vs_") and is_faction_mult(k2):
+                    value2, neg2 = faction_mult_to_mag(k2)
+                    if is_inverted(sid2):
+                        neg2 = not neg2
+                    (neg if neg2 else pos).append((sid2, value2))
+                    continue
+                # 出界的 x/×（如「多重射击 ×59」）：不猜数值，保留「无极性符号」
+                # 跳过（与旧行为一致）；上面主路径的同类出界按普通数值读。
             notes.append(f"无极性符号：{raw}")
             continue
         neg_flag = _POLARITY.get(m.group(1), False)
@@ -419,15 +642,27 @@ def parse_riven_lines(lines, resolve) -> tuple:
         if not sid:
             notes.append(f"词条名认不出：{raw}")
             continue
-        mm = _MULT_RE.search(body)
+        mm = _MULT_RE.search(_strip_parens(raw))
+        k = None
         if mm:
+            # 乘数在一整行里找（`x` 可能已被上面的极性正则吃掉），极性由
+            # 乘数本身决定：x1.51 是正词条、x0.55 是负词条。
+            # ★ 2026-10-05 P0：搜的是剥掉括号后缀的文案 —— 括号里的
+            #   「重击时 x2」不是乘数，参与匹配会把 211.4 换成 100.0。
             try:
                 k = float((mm.group(1) or mm.group(2)).replace(",", "."))
             except ValueError:
                 notes.append(f"乘数读不出：{raw}")
                 continue
-            value, neg_flag = round((1 - k) * 100, 2), True
+        if k is not None and sid.startswith("damage_vs_") and is_faction_mult(k):
+            # ★ 2026-10-05 P0：乘数分支**仅**对 damage_vs_* 启用（与下面
+            #   `value < _FACTION_MIN_MAG and sid.startswith("damage_vs_")`
+            #   的兜底同口径）；其余词条一律走普通数值分支，禁止拿乘数换算。
+            value, neg_flag = faction_mult_to_mag(k)
         else:
+            # 普通数值分支。也覆盖「x/× 出界」：窄读把词条图标抄成 × 的行
+            # （线上实证「×59% 多重射击」）——出界的 x 不是派系乘数，数字按
+            # 普通数值读（旧实现按乘数换算成 |1−59|×100 = 5800%）。
             mn = _NUM_RE.search(body)
             if not mn:
                 notes.append(f"无数值：{raw}")
@@ -437,11 +672,18 @@ def parse_riven_lines(lines, resolve) -> tuple:
             except ValueError:
                 notes.append(f"数值读不出：{raw}")
                 continue
-            if value < 1 and sid.startswith("damage_vs_"):
-                # 对派系伤害的乘数写法漏了 x（基值 45，真 magnitude 不可能 <1）
-                value, neg_flag = round((1 - value) * 100, 2), True
+            if value < _FACTION_MIN_MAG and sid.startswith("damage_vs_"):
+                # 乘数漏写 x（或只写了 1.51 / 0.55）：对派系真 magnitude ≥ 11，
+                # 按乘数还原并据乘数定极性（旧版一律当负词条 ⇒ 正词条会算错）。
+                value, neg_flag = faction_mult_to_mag(value)
+        # ★ 2026-10-02：反转词条翻转极性 —— 「+95.4% 武器后坐力」是负面、
+        #   「-20% 武器后坐力」是正面（证据见 INVERTED_STATS 注释）；
+        #   「仅负向」词条（连击获取）无论读到什么符号都归负面。
+        if is_negative_only(sid):
+            neg_flag = True
+        elif is_inverted(sid):
+            neg_flag = not neg_flag
         (neg if neg_flag else pos).append((sid, value))
     # 同一条词条不可能既正又负（卡面每行只出现一次）：两侧都在时以负为准
     neg_ids = {sid for sid, _ in neg}
-    return (_dedup_pairs([p for p in pos if p[0] not in neg_ids]),
-            _dedup_pairs(neg), notes)
+    return (_dedup_pairs([p for p in pos if p[0] not in neg_ids]), _dedup_pairs(neg), notes)
