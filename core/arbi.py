@@ -112,6 +112,17 @@ TYPES = (
     "救援",
     "破坏任务",
 )
+# 简写 → 规范值（与查询侧同口径：回收 = 资源回收）。
+# ★ 2026-10-16（第十五批 A1）：此前 parse_rule 把「回收」原样放进集合，而 mission_of() 归一后是
+#   「资源回收」⇒ `蹲 仲裁 回收` 永远 match 不上、永不推送。
+TYPE_ALIAS = {"回收": "资源回收"}
+# ★ 2026-10-16（用户要求）：仲裁卡上凡出现评级，下方都标评分范围 —— 三张卡共用这一句，阈值改了只改这里。
+#   范围与 scripts/build_arb_ratings.py::TIERS 一致（F 放宽到 <450 为用户 10-16 口径）。
+TIER_RANGE = "S≥800 / A+≥700 / A≥600 / A-≥450 / F<450（每小时生息）"
+TIER_NOTE = (
+    "※ 评级：arbi.wf.wiki 官方 tierlist 优先，官方未评级的节点用「社区实测中位数」补；"
+    f"评分范围 {TIER_RANGE}"
+)
 TYPES_STR = (
     "生存 / 防御 / 镜像防御 / 拦截 / 挖掘 / 叛逃 / 回收 / 中断 / "
     "歼灭 / 捕获 / 虚空洪流 / 虚空覆涌 / 虚空决战 / 联结生存 / 元素转换"
@@ -195,8 +206,48 @@ async def fetch_tables(client) -> tuple[dict, dict, dict]:
     return sched, nodes, merge_measured_tiers(tier_of)
 
 
+class ScheduleExpired(Exception):
+    """给定时刻超出排期表覆盖范围（表已到期 / 尚未开始）。"""
+
+    def __init__(self, end_ts: float, start_ts: float = 0.0):
+        self.end_ts = end_ts
+        self.start_ts = start_ts
+        super().__init__(f"arbi schedule covers [{start_ts}, {end_ts})")
+
+
+def schedule_end(sched: dict) -> float:
+    """排期表覆盖到的最后时刻（epoch 秒，开区间）。"""
+    return sched["startTs"] + len(sched["seq"]) * sched.get("stepSec", 3600)
+
+
+def expired_hint(sched: dict) -> str:
+    """排期表到期时给用户看的提示（北京时间）。"""
+    from datetime import datetime, timedelta, timezone
+
+    end = datetime.fromtimestamp(schedule_end(sched), tz=timezone(timedelta(hours=8)))
+    return (
+        f"仲裁排期表已于 {end:%Y-%m-%d %H:%M}（北京时间）到期，数据源 arbi.wf.wiki 尚未更新；"
+        "为避免显示错误场次，暂停推算"
+    )
+
+
+def next_switch(ts: Optional[float] = None, sched: Optional[dict] = None) -> float:
+    """下一次仲裁换场的时刻（epoch 秒）。
+
+    仲裁每小时整点轮换（排期表 ``stepSec`` = 3600、``startTs`` 对齐整点）；
+    给了 ``sched`` 就按表的起点/步长算，否则按整点算（不联网，供「时效」卡用）。
+    """
+    now = time.time() if ts is None else ts
+    start = (sched or {}).get("startTs", 0)
+    step = (sched or {}).get("stepSec", 3600) or 3600
+    return start + (int((now - start) // step) + 1) * step
+
+
 def key_at(sched: dict, ts: Optional[float] = None) -> tuple[str, int, float, float]:
     """给定时刻的仲裁节点 key。
+
+    ★ 2026-10-11：超出排期表覆盖范围时**抛 ScheduleExpired**（旧写法 ``% len(seq)``
+    回绕到表头 ⇒ 表到期（约 2029-10）后会静默给出几年前的场次）。
 
     Returns:
         ``(key, idx, start_ts, step)`` —— ``idx`` 用于算「下一小时」。
@@ -204,7 +255,9 @@ def key_at(sched: dict, ts: Optional[float] = None) -> tuple[str, int, float, fl
     seq = sched["seq"]
     start = sched["startTs"]
     step = sched.get("stepSec", 3600)
-    idx = int(((time.time() if ts is None else ts) - start) // step) % len(seq)
+    idx = int(((time.time() if ts is None else ts) - start) // step)
+    if idx < 0 or idx >= len(seq):
+        raise ScheduleExpired(schedule_end(sched), start)
     return sched["nodes"][seq[idx]], idx, start, step
 
 
@@ -213,7 +266,7 @@ def slot(sched: dict, nodes: dict, tier_of: dict, ts: Optional[float] = None) ->
     key, idx, start, step = key_at(sched, ts)
     n = nodes.get(key) or {}
     seq = sched["seq"]
-    nxt_key = sched["nodes"][seq[(idx + 1) % len(seq)]]
+    nxt_key = sched["nodes"][seq[idx + 1]] if idx + 1 < len(seq) else ""
     tier = tier_of.get(key, "") or ""
     if tier == "未评级":
         tier = ""
@@ -225,7 +278,7 @@ def slot(sched: dict, nodes: dict, tier_of: dict, ts: Optional[float] = None) ->
         "faction": faction_of(n),
         "tier": tier,
         "line": node_line(nodes, key, tier_of),
-        "next_line": node_line(nodes, nxt_key, tier_of),
+        "next_line": node_line(nodes, nxt_key, tier_of) if nxt_key else "（排期表已到末尾）",
         "start": start + idx * step,
         "end": start + (idx + 1) * step,
     }
@@ -255,7 +308,7 @@ def parse_rule(rule: str) -> tuple[set[str], tuple[str, ...], list[str]]:
         if w in RATING:
             ratings = RATING[w]
         elif w in TYPES:
-            types.add(w)
+            types.add(TYPE_ALIAS.get(w, w))
         else:
             unknown.append(w)
     return types, ratings, unknown

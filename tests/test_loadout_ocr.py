@@ -336,6 +336,10 @@ _ocr_inc = {
         {"name": "镀层 斩铁", "drain": "6", "polarity": "?"},
         {"name": "急进猛突", "drain": "7", "polarity": "?"},
         {"name": "角斗士 威猛", "drain": "9", "polarity": "?"},
+        # ★ 2026-10-05 订正：真实卡装了热病打击 Prime（旧 fixture 漏了它、
+        #   还把穿刺/切割两行的值互换 —— 那套输入迫使反推编造「自带毒 511.5」，
+        #   即本批证伪并修掉的幻影；详见 output/分析-灵化执法者配卡识别差异-*.md）
+        {"name": "热病打击 Prime", "drain": "8", "polarity": "?"},
     ],
     "panel": {
         "attack_speed": "0.833",
@@ -345,8 +349,8 @@ _ocr_inc = {
         "damage_rows": [
             ["毒素", "1,125.3"],
             ["冲击", "545.6"],
-            ["穿刺", "34.1"],
-            ["切割", "102.3"],
+            ["穿刺", "102.3"],
+            ["切割", "34.1"],
         ],
         "total": ["总计", "1,807.3"],
     },
@@ -361,17 +365,23 @@ check(
 )
 check("反推基础暴伤 = 7 / 1.6 = 4.375", close(_wi["criticalMultiplier"], 4.375, 1e-6))
 check("反推基础触发 = 10%", close(_wi["procChance"], 0.10, 1e-6))
-# 本 fixture 未装毒素 MOD → 毒素行全是自带元素：1125.3/2.2 = 511.5
-# （压迫点满级 +120% → after_base = 2.2）
+# ★ 2026-10-05 订正：旧断言「自带毒 511.5、总伤 821.5」建立在被删掉的
+#   毒素 MOD 与互换的行名上 —— 真值是基础 310（210 + 灵化 +100 按比例分摊）、
+#   **无自带毒素**（毒 100% 来自热病打击 Prime：682×1.65 = 1125.3）；
+#   面板四行校验因此全过（见下「反推路径面板校验」）。幻影由防线③拦截。
 check(
-    "反推自带元素毒素 = 1125.3/2.2 ≈ 511.5（无 MOD 时整行即自带）",
-    close(_wi["damage"].get("toxin", 0.0), 511.5, 0.05),
-    str(_wi["damage"].get("toxin")),
+    "反推基础 = 310（210 + 灵化 +100），无幻影自带毒素",
+    _wi["damage"].get("impact") == 248
+    and _wi["damage"].get("puncture") == 46.5
+    and _wi["damage"].get("slash") == 15.5
+    and close(_wi["damage"]["total"], 310.0, 0.05)
+    and not _wi["damage"].get("toxin"),
+    str(_wi["damage"]),
 )
 check(
-    "反推基础总伤 = IPS 310.0 + 自带毒素 511.5 ≈ 821.5",
-    close(_wi["damage"]["total"], 821.5, 0.05),
-    str(_wi["damage"]["total"]),
+    "  note 带灵化对账（310 ＝ 210 + 100）；毒素行被 MOD 完全解释、无需幻影",
+    "灵化进化 +100" in (_an_inc.get("panel_base") or "") and not _wi["damage"].get("toxin"),
+    str(_an_inc.get("panel_base")),
 )
 check(
     "反推路径面板校验开启且全部吻合（净基础+MOD一次）",
@@ -573,10 +583,15 @@ check(
     all(c["ok"] for c in _an_fix.get("checks") or []),
     str(_an_fix.get("checks")),
 )
+# ★ 2026-10-09 订正：本 fixture 的「穿刺 34.1 / 切割 102.3」本身是对调的读数 ——
+#   同一张截图的另两份 fixture（_ocr_inc、遮挡用例的面板重建）都是穿刺 102.3 /
+#   切割 34.1，库内构成 168/31.5/10.5 ×1.476×2.2 也给出 545.6/102.3/34.1。
+#   旧断言「穿刺 15.5」把对调值钉成了预期；物理行串行纠正后应为 102.3/2.2 = 46.5
 check(
-    "拼接后：穿刺基础恢复正常（34.1/2.2 ≈ 15.5）",
-    close(_an_fix["weapon"]["damage"].get("puncture", 0), 15.5, 0.05),
-    str(_an_fix["weapon"]["damage"].get("puncture")),
+    "拼接后：穿刺/切割对调被纠回（穿刺 102.3/2.2 ≈ 46.5、切割 34.1/2.2 ≈ 15.5）",
+    close(_an_fix["weapon"]["damage"].get("puncture", 0), 46.5, 0.05)
+    and close(_an_fix["weapon"]["damage"].get("slash", 0), 15.5, 0.05),
+    str(_an_fix["weapon"]["damage"]),
 )
 check(
     "拼接后：满级热病 +165% 完全解释毒素行 → 无自带毒素",
@@ -672,7 +687,15 @@ check(
     "第二页：含暴击期望与重击段",
     any("暴击期望" in ln for ln in _detail) and any("重击" in ln for ln in _detail),
 )
-check("第二页：单发与面板对拍一致（456）", any("456" in ln for ln in _detail))
+# 第二页单发须与第一页「参考」单发同值（同一 calculate 管线自洽）。
+# 2026-10-10 改：原写死 456 —— 那是本引擎算出来的值（不是游戏读数），加伤害量化后为 462
+# 2026-10-11 卡片改版：第二页「单发对血：462」→ 单发表行「· 对血　462（无暴击）…」
+_ref_h = f"· 对血　{(_an_inc.get('ref') or {}).get('health', -1):.0f}（无暴击）"
+check(
+    "第二页：单发与第一页参考值对拍一致（量化后 462，原 456）",
+    _ref_h.startswith("· 对血　462") and any(ln.startswith(_ref_h) for ln in _detail),
+    _ref_h,
+)
 
 from core.parser import parse as _parse  # noqa: E402
 
@@ -879,7 +902,7 @@ for _mod, _rk, _dr, _want, _why in BRANCH_CASES:
 
 # ---------------------------------------------------------------------------
 # 裂罅紫卡（Riven）：名字 =「武器名 + 随机词缀」，静态词典永远匹配不上。
-# 用户方案文档 TC-04 指出这类必须单独归类 —— 否则会报成「库中未收录」，
+# 方案文档 TC-04 指出这类必须单独归类 —— 否则会报成「库中未收录」，
 # 让人误以为是我们缺数据。等级仍能从豆子读出来。
 # ---------------------------------------------------------------------------
 RIVEN_CASES = [
@@ -939,6 +962,297 @@ check(
     and not any("库中未收录" in ln for ln in _lines_riven),
     str([ln for ln in _lines_riven if "紫卡" in ln or "未收录" in ln]),
 )
+
+
+# ---------------------------------------------------------------------------
+# ★ 2026-10-05 灵化反推「锚定补全」回归（执法者实战卡）：
+#   面板穿刺行行名被滚动箭头遮挡 → 旧行为整行静默丢 → 本地推算 1705 ≠ 面板
+#   1807.3、且毒素行反解出幻影自带毒 29（真值 0）。修复后：
+#   缺行按库内比例×中位锚补全、幻影防线收紧、灵化 +100 对账写进 note。
+# ---------------------------------------------------------------------------
+_weapon_magistar = {
+    "name": "Magistar",
+    "uniqueName": "/Lotus/Weapons/Tenno/Melee/Maces/PaladinMace/PaladinMaceWeapon",
+    "damage": {"total": 209.99998, "impact": 168, "puncture": 31.5, "slash": 10.5},
+    "criticalChance": 0.2,
+    "criticalMultiplier": 2.0,
+}
+_totals_mag = {
+    "base_dmg": 120.0,
+    "crit_chance": 110.0,
+    "crit_dmg": 140.0,
+    "status_chance": 0.0,
+    "elements": {"toxin": 165.0},
+    "physical": {},
+}
+_panel_occluded = {
+    "crit_chance": "75.6%",
+    "crit_damage": "7 倍",
+    "status_chance": "10%",
+    "damage_rows": [["毒素", "1,125.3"], ["冲击", "545.6"], ["切割", "34.1"]],
+    "total": ["", "1,807.3"],
+}
+_w_occ, _n_occ = lo._panel_base_weapon(_weapon_magistar, _panel_occluded, _totals_mag)
+_d_occ = (_w_occ or {}).get("damage") or {}
+check(
+    "灵化锚定补全：穿刺行被遮挡 → 按库内比例补出 46.5（基础 248/46.5/15.5，计 310）",
+    _d_occ.get("impact") == 248
+    and _d_occ.get("puncture") == 46.5
+    and _d_occ.get("slash") == 15.5
+    and _d_occ.get("total") == 310,
+    str(_d_occ),
+)
+check(
+    "  不再出现幻影自带毒素（真值 0：毒 100% 来自热病打击 Prime）",
+    not _d_occ.get("toxin"),
+    str(_d_occ.get("toxin")),
+)
+check(
+    "  note 说明「穿刺行未读到…已按库内比例补全」",
+    "穿刺行未读到" in (_n_occ or "") and "46.5" in (_n_occ or ""),
+    _n_occ,
+)
+check(
+    "  note 对账「反推基础 310 ＝ 库内 210 ＋ 灵化进化 +100」",
+    "灵化进化 +100" in (_n_occ or "") and "与 evolutions 数据吻合" in (_n_occ or ""),
+    _n_occ,
+)
+check(
+    "  面板重建逐行吻合（545.6/102.3/34.1/1125.3，总 1807.3）",
+    abs(_d_occ["impact"] * 2.2 - 545.6) < 0.05
+    and abs(_d_occ["puncture"] * 2.2 - 102.3) < 0.05
+    and abs(_d_occ["slash"] * 2.2 - 34.1) < 0.05
+    and abs(
+        (_d_occ["impact"] + _d_occ["puncture"] + _d_occ["slash"] + _d_occ.get("toxin", 0))
+        * 2.2
+        * 1.65
+        - 1125.3
+    )
+    < 0.3,
+    str(
+        [
+            round(_d_occ["impact"] * 2.2, 1),
+            round(_d_occ["puncture"] * 2.2, 1),
+            round(_d_occ["slash"] * 2.2, 1),
+        ]
+    ),
+)
+check(
+    "  行名乱猜（未归属行）同场景 → 同样补全且 note 提示未归属",
+    (lambda w, n: (w or {}).get("damage", {}).get("puncture") == 46.5 and "未能归属" in (n or ""))(
+        *lo._panel_base_weapon(
+            _weapon_magistar,
+            dict(_panel_occluded, damage_rows=_panel_occluded["damage_rows"] + [["", "102.3"]]),
+            _totals_mag,
+        )
+    ),
+)
+check(
+    "对照：库内真有自带元素的武器 → 反解 E0 被接受（防线不误伤）",
+    lo._panel_base_weapon(
+        {
+            "name": "InnateToxin",
+            "uniqueName": "/test/innate",
+            "damage": {"total": 310, "impact": 168, "puncture": 31.5, "slash": 10.5, "toxin": 100},
+            "criticalChance": 0.2,
+            "criticalMultiplier": 2.0,
+        },
+        {"damage_rows": [["毒素", "220.0"], ["冲击", "369.6"], ["穿刺", "69.3"], ["切割", "23.1"]]},
+        {
+            "base_dmg": 120.0,
+            "crit_chance": 0.0,
+            "crit_dmg": 0.0,
+            "status_chance": 0.0,
+            "elements": {},
+            "physical": {},
+        },
+    )[0]
+    is None,
+)
+
+check(
+    "非灵化武器部分行漏读（缩放锚=1）→ 反推与库一致 → 不覆盖（None）",
+    lo._panel_base_weapon(
+        {
+            "name": "TestWeapon",
+            "uniqueName": "/test/w",
+            "damage": {"total": 210, "impact": 168, "puncture": 31.5, "slash": 10.5},
+            "criticalChance": 0.2,
+            "criticalMultiplier": 2.0,
+        },
+        {"damage_rows": [["冲击", "369.6"]], "total": ["", "460.2"]},
+        _totals_mag,
+    )[0]
+    is None,
+)
+check(
+    "幻影防线：库内+灵化库均无该元素 → 反解自带元素判 0（不进基础）",
+    (lambda w, n: (w is None) or not (w.get("damage") or {}).get("toxin"))(
+        *lo._panel_base_weapon(
+            {
+                "name": "NoInnate",
+                "uniqueName": "/test/no_innate",
+                "damage": {"total": 178.5, "impact": 168, "puncture": 0, "slash": 10.5},
+                "criticalChance": 0.2,
+                "criticalMultiplier": 2.0,
+            },
+            {"damage_rows": [["毒素", "1,125.3"], ["冲击", "369.6"], ["切割", "23.1"]]},
+            _totals_mag,
+        )
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# 2026-10-09：识卡射速 MOD 进伤害 spec（修前 totals.fire_rate 从未传下去）
+# 判据 = fireRate 是否取自面板「攻速」行（终值）：是 ⇒ 不叠；否 ⇒ 叠 totals.fire_rate
+# ---------------------------------------------------------------------------
+_lex0 = lo.analyze(
+    {"weapon": "雷克斯", "mods": [{"name": "弹头撞击", "drain": "9", "color": "白"}], "panel": {}}
+)
+_lex1 = lo.analyze(
+    {
+        "weapon": "雷克斯",
+        "mods": [
+            {"name": "乏能迅敏", "drain": "9", "color": "白"},
+            {"name": "弹头撞击", "drain": "9", "color": "白"},
+        ],
+        "panel": {},
+    }
+)
+check("库基础路径：乏能迅敏 totals.fire_rate = 90", close(_lex1["totals"].get("fire_rate"), 90.0))
+check(
+    "库基础路径：参考射速 = 基础 ×1.9",
+    close(_lex1["ref"]["fire_rate"], _lex0["ref"]["fire_rate"] * 1.9, 1e-9),
+    f"{_lex0['ref']['fire_rate']} → {_lex1['ref']['fire_rate']}",
+)
+check(
+    "库基础路径：+90% 射速 −15% 基伤 ⇒ DPS 上升（修前反降 32.4→27.5）",
+    _lex1["ref"]["dps"] > _lex0["ref"]["dps"],
+    f"{_lex0['ref']['dps']:.1f} → {_lex1['ref']['dps']:.1f}",
+)
+check(
+    "面板攻速路径（执法者）：fireRate 取自面板并打标记",
+    _an_inc["weapon"].get(lo.FIRE_RATE_FROM_PANEL) is True,
+)
+_inc_spec = lo.to_damage_spec({**_an_inc, "totals": {**_an_inc["totals"], "fire_rate": 30.0}})
+check(
+    "面板攻速路径：即使有射速 MOD 也不再叠加（防二次加成）", close(_inc_spec["fire_rate_pct"], 0.0)
+)
+check(
+    "反推但无攻速行（拉特昂 Prime）：关键延迟 −20% 计入",
+    _an_lat["weapon"].get(lo.FIRE_RATE_FROM_PANEL) is None
+    and close(lo.to_damage_spec(_an_lat)["fire_rate_pct"], -20.0),
+    str(lo.to_damage_spec(_an_lat)["fire_rate_pct"]),
+)
+
+# ---------------------------------------------------------------------------
+# 2026-10-09 拉特昂 Prime 截图实测（关键延迟 −20%：「射击速度 4.17 ▸ 3.33」）
+# B) 面板=终值：读到攻速行 / 没读到攻速行 两条路径必须取同一值
+# C) 两列取值：模型把「基础 ▸ 终值」两列一起给时，一律取右列（修前取左列=基础值）
+# ---------------------------------------------------------------------------
+import copy  # noqa: E402
+
+
+def _lat_with(**panel):
+    o = copy.deepcopy(_ocr_lat)
+    o["panel"].update(panel)
+    an = lo.analyze(o)
+    return an, dc_mod.calculate(lo.to_damage_spec(an), an["weapon"])
+
+
+_lat_fr = {}
+for _lab, _asp in (
+    ("无攻速行", None),
+    ("右列单值 3.33", "3.33"),
+    ("两列字符串", "4.17 ▸ 3.33"),
+    ("两列列表", ["4.17", "3.33"]),
+):
+    _a, _r = _lat_with(**({} if _asp is None else {"attack_speed": _asp}))
+    _lat_fr[_lab] = _r["fire_rate"]
+    check(
+        f"拉特昂 Prime 截图：{_lab} ⇒ 射速 ≈ 3.33（基础 4.166667 × 0.8）",
+        abs(_r["fire_rate"] - 3.3333) <= 0.005,
+        f"{_r['fire_rate']} / weapon.fireRate={_a['weapon'].get('fireRate')}",
+    )
+check(
+    "拉特昂 Prime 截图：读到面板 / 没读到面板 两条路径同值（差 ≤ 0.005）",
+    max(_lat_fr.values()) - min(_lat_fr.values()) <= 0.005,
+    str(_lat_fr),
+)
+_lat_ref = _lat_with()[0]["weapon"]
+for _k, _pair, _wk in (
+    ("crit_chance", "22% ▸ 138%", "criticalChance"),
+    ("crit_damage", "2.8倍 ▸ 6.6倍", "criticalMultiplier"),
+    ("status_chance", "26% ▸ 41.6%", "procChance"),
+):
+    _w = _lat_with(**{_k: _pair})[0]["weapon"]
+    check(
+        f"两列取右：{_k}={_pair!r} 反推基础与单值输入一致",
+        close(_w[_wk], _lat_ref[_wk]),
+        f"{_w[_wk]} vs {_lat_ref[_wk]}",
+    )
+
+# ---------------------------------------------------------------------------
+# 2026-10-09 拉特昂 Prime 线上复报：模型读串 →「冲击 203.5 / 穿刺 25.4」对调 +
+# 病毒行误抄总计 1488.3（线上卡面「行和×多重 1488.3 vs 3136.68」即
+# (203.5+25.4+25.4+1488.3)×1.8 —— 由此反推的读数，原始 JSON 未留档）
+# ---------------------------------------------------------------------------
+_lat_bad, _lat_bad_r = _lat_with(
+    damage_rows=[
+        ["冲击", "72", "203.5"],
+        ["穿刺", "9", "25.4"],
+        ["切割", "9", "25.4"],
+        ["病毒（冰+毒）", "-", "1,488.3"],
+        ["总计", "90", "1,488.3"],
+    ]
+)
+_lat_good_r = _lat_with()[1]
+_bd = _lat_bad["weapon"]["damage"]
+check(
+    "读串纠正：冲击/穿刺对调 ⇒ 按库内构成纠回 冲击 9.6 / 穿刺 76.8",
+    close(_bd["impact"], 9.6) and close(_bd["puncture"], 76.8) and close(_bd["slash"], 9.6),
+    str(_bd),
+)
+check(
+    "读串纠正：单发对血与正确读数一致（修前冲击吃 G 系弱点虚高 203 vs 184）",
+    close(_lat_bad_r["health"], _lat_good_r["health"], 1e-6),
+    f"{_lat_bad_r['health']} vs {_lat_good_r['health']}",
+)
+check(
+    "读串纠正：卡面注明已纠正 + 病毒行误抄总计",
+    "串行" in _lat_bad["panel_base"] and "误抄总计" in _lat_bad["panel_base"],
+    _lat_bad["panel_base"],
+)
+check(
+    "行和自检：误抄总计的元素行剔除后补本地合成元素 ⇒ 全部吻合（修前 3136.68 ⚠）",
+    all(c["ok"] for c in _lat_bad["checks"]) and not any(c.get("note") for c in _lat_bad["checks"]),
+    str([(c["label"], c["panel"], round(c["calc"], 2), c["ok"]) for c in _lat_bad["checks"]]),
+)
+check(
+    "「总计」行不再记为「行名未能归属类型」",
+    "未能归属" not in _lat_bad["panel_base"]
+    and "未能归属" not in lo.analyze(_ocr_lat)["panel_base"],
+)
+check(
+    "普通形态 + 灵化进化的面板不标成「灵化形态」",
+    _lat_bad["panel_base"].startswith("普通形态（含灵化进化加成）"),
+    _lat_bad["panel_base"][:30],
+)
+_lat_card2 = "\n".join(
+    dc_mod.card_lines(_lat_bad["weapon"], lo.to_damage_spec(_lat_bad), _lat_bad_r, [])
+)
+check("面板反推的基础不再标「含多段合并」", "含多段合并" not in _lat_card2)
+check(
+    "不误纠：分布本来就吻合的正确读数不出「串行」",
+    "串行" not in lo.analyze(_ocr_lat)["panel_base"],
+)
+_lat_text = "\n".join(lo.card_lines(lo.analyze(_ocr_lat)))
+check("负值加成不再写成「+-」", "+-" not in _lat_text and "射速-20%" in _lat_text)
+check(
+    "同族近似：「镀层 氚晶猫具」（错两字）⇒ Galvanized Scope",
+    (lo.match_mod("镀层 氚晶猫具")[0] or {}).get("name") == "Galvanized Scope",
+)
+check("同族近似：族内别的卡不被误吸", lo.match_mod("镀层 某某某某")[0] is None)
 
 if FAILED:
     print(f"\n失败 {len(FAILED)} 项：{FAILED}")

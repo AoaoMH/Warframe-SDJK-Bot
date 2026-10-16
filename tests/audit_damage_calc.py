@@ -62,7 +62,17 @@ print(
 no_zh = [v["name"] for v in w.values() if not v.get("zh")]
 if no_zh:
     mid(f"{len(no_zh)} 件武器没有中文名（卡面会退化显示英文）：{no_zh[:5]}")
-no_dmg = [v["name"] for v in w.values() if not (v.get("damage") or {}).get("total")]
+# 直击 0 是 wiki 口径的（Simulor 系 Orb Launch = 冲击 0，伤害全在范围段，b7 批）：attacks 里有
+# 一段合计 0、且另有段 > 0 的不算缺失
+no_dmg = [
+    v["name"]
+    for v in w.values()
+    if not (v.get("damage") or {}).get("total")
+    and not (
+        any(a.get("total") == 0 for a in v.get("attacks") or [])
+        and any((a.get("total") or 0) > 0 for a in v.get("attacks") or [])
+    )
+]
 if no_dmg:
     mid(f"{len(no_dmg)} 件武器 damage.total 为 0/缺失：{no_dmg[:5]}")
 
@@ -269,11 +279,22 @@ r_e = dc.calculate(s_e, w100)
 chk(
     "元素 MOD 按总基伤 90%（=90 火伤）", close(r_e["pools"].get("heat", 0), 90.0), str(r_e["pools"])
 )
+
+
+# per_type_health 是**量化后**、乘派系与护甲后的值（量化 2026-10-10 加，67668d9）。
+# 预期按 wiki Damage/Calculation §Quantization 独立推导：各类型取整到
+# 「改后基伤 / 32」的整数倍，floor(x/scale + 0.5)；元素/物理 MOD 不改 scale，基伤 MOD 改。
+# 默认派系 Grineer 对切割/火焰均 ×1.0，故 ÷(1-DR) 即回到量化后的分伤。
+def wiki_quantized(x: float, modded_base: float) -> float:
+    scale = modded_base / 32
+    return math.floor(x / scale + 0.5) * scale
+
+
 s_p, _ = dc.parse_args(["切90"])
 r_p = dc.calculate(s_p, w100)
 chk(
-    "物理 MOD 按同类型基础值（50×1.9=95）",
-    close(r_p["per_type_health"]["slash"] / (1 - r_p["dr"]), 95.0, 1e-6),
+    "物理 MOD 按同类型基础值（50×1.9=95，量化到 100/32 ⇒ 93.75）",
+    close(r_p["per_type_health"]["slash"] / (1 - r_p["dr"]), wiki_quantized(50 * 1.9, 100.0), 1e-6),
     str(r_p["per_type_health"]),
 )
 
@@ -281,9 +302,11 @@ chk(
 s_b, _ = dc.parse_args(["基伤100", "火90"])
 r_b = dc.calculate(s_b, w100)
 chk(
-    "基伤+100% 后 元素 = 90%×200 = 180",
+    "基伤+100% 后 元素 = 90%×200 = 180（量化到 200/32 ⇒ 181.25）",
     close(r_b["pools"].get("heat", 0), 90.0)  # pools 存的是百分比
-    and close(r_b["per_type_health"]["heat"] / (1 - r_b["dr"]), 180.0, 1e-6),
+    and close(
+        r_b["per_type_health"]["heat"] / (1 - r_b["dr"]), wiki_quantized(0.9 * 200, 200.0), 1e-6
+    ),
     f"heat 项 {r_b['per_type_health'].get('heat')}",
 )
 
@@ -373,15 +396,19 @@ for toks, label in EDGE:
 print("=" * 74)
 print("⑦ v1.5 新机制")
 
-# ① 敌人名分派：MOD 子串绝不能抢走敌人名
+# ① 敌人名分派：MOD 子串绝不能抢走敌人名。
+# 2026-10-10 敌人表精简到常用 19 个后，这 6 个都已不在表里（且保留的 19 个没有一个是
+# MOD 全名/唯一子串）⇒ 同一语义改为：「对 X」认不出敌人时记进 enemy_miss（卡面提示可用
+# 敌人、按默认派系算），**仍不许被当成 MOD**（修前 Butcher 会被 Butcher's Revelry 子串套上、
+# Scorch/Seeker 被同名 MOD 全名套上）。
 for _n in ("Comba", "Butcher", "Napalm", "Ballista", "Scorch", "Seeker"):
     _sp, _ = dc.parse_args(["绝路p", "对", _n, "100级"])
     got = (_sp["enemy"] or {}).get("name")
-    if got != _n:
-        hi(f"🔴 敌人名被抢：「{_n}」解析成了 {got!r}（应有 {_n}）")
+    if got is not None or _sp.get("enemy_miss") != _n:
+        hi(f"🔴 已删敌人「{_n}」应进 enemy_miss，实得 enemy={got!r} miss={_sp.get('enemy_miss')!r}")
     if _sp["mods"]:
         hi(f"🔴 「{_n}」被当成了 MOD：{[m.get('name') for m in _sp['mods']]}")
-print("  [OK] 敌人名分派（Comba/Butcher/Napalm/Ballista/Scorch/Seeker）")
+print("  [OK] 敌人名分派（Comba/Butcher/Napalm/Ballista/Scorch/Seeker：不在表 → 提示，不当 MOD）")
 
 # ② 敌人爆头倍率：Eidolon 类 head_mul=1 → 爆头不吃加成
 _sp, _ = dc.parse_args(["绝路p", "对", "Eidolon Teralyst", "100级", "爆头"])
@@ -390,9 +417,11 @@ if not close(_r["head_mult"], 1.0, 1e-9):
     hi(f"🔴 Eidolon 爆头倍率应为 1.0，得到 {_r['head_mult']}")
 _sp2, _ = dc.parse_args(["绝路p", "对", "重型机枪手", "100级", "爆头"])
 _r2 = dc.calculate(_sp2, base_w)
-if not close(_r2["head_mult"], 2.0, 1e-9):
-    hi(f"🔴 普通单位爆头倍率应为 2.0，得到 {_r2['head_mult']}")
-print("  [OK] 爆头倍率按敌人（Eidolon ×1 / 普通 ×2）")
+# 2026-10-09 B2：人形头部 ×3（wiki Enemy_Body_Parts / wfsim MECHANICS.md:1001-1003）；
+# 重型机枪手 head_mul 3.0（wiki Module:Enemies/data，scripts/merge_wfsim_enemies.py 补丁）
+if not close(_r2["head_mult"], 3.0, 1e-9):
+    hi(f"🔴 普通单位爆头倍率应为 3.0，得到 {_r2['head_mult']}")
+print("  [OK] 爆头倍率按敌人（Eidolon ×1 / 普通人形 ×3）")
 
 # ③ 状态伤害只作用于 DoT
 _s1, _ = dc.parse_args(["G系", "100级"])

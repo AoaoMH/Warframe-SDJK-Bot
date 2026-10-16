@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import difflib
+import itertools
 import json
 import math
 import re
@@ -62,13 +63,17 @@ ELEM_PAIRS = {
 }
 
 
+# ★★ 2026-10-05 去掉字面示例值：阴性对照实测（喂**紫卡图**——卡面没有容量栏/
+#   伤害栏）本提示词 8B 3/6、30B 4/5 次吐出 `"capacity": "0/70"`，即照抄旧例子。
+#   旧例子里的 0/70 / 144 / 1,807.3 / 75.6 / 22▶138 / 驱魔之刃 [30] 全部来自
+#   用户真实截图 ⇒ **本提示词不得再出现任何具体数值**，一律用占位符/描述表达。
 VISION_PROMPT = """这是 Warframe（星际战甲）游戏内武器升级界面的截图。
 请**只读出图中确实可见的文字与数字**，不要推测、不要补全、不要翻译。
 
 严格输出如下 JSON（不要 markdown 代码块、不要任何解释文字）：
 {
-  "weapon": "顶部武器名，原文照抄（含方括号里的等级数字，如 驱魔之刃 [30]）",
-  "capacity": "容量那一行右侧的数字，形如 0/70",
+  "weapon": "顶部武器名，原文照抄（含方括号里的等级数字）",
+  "capacity": "容量那一行右侧的数字，形如「左值/右值」",
     "mods": [
     {"name": "卡片上的 MOD 名称，原文照抄（图上中文就用中文）",
      "drain": 卡片右上角的数字（只要整数）,
@@ -76,7 +81,7 @@ VISION_PROMPT = """这是 Warframe（星际战甲）游戏内武器升级界面�
      "polarity": "卡片左上角的极性符号，只可能是 V / D / — / Y / = 之一，看不清写 ?"}
   ],
   "panel": {
-    "attack_speed": "攻击速度行的数字",
+    "attack_speed": "射击速度（枪械）或攻击速度（近战）行 ▶ 右边的 MOD 后值",
     "crit_chance": "暴击几率行的数字（含百分号）",
     "crit_damage": "暴击伤害行的数字（含「倍」）",
     "status_chance": "触发几率行的数字（含百分号）",
@@ -97,11 +102,10 @@ VISION_PROMPT = """这是 Warframe（星际战甲）游戏内武器升级界面�
 2. drain 只填整数，不要带箭头、百分号、上标等符号；
 3. **damage_rows 是重点，一条都不能漏**：左侧「伤害」栏里每一行都要给 ——
    冲击 / 穿刺 / 切割 / 各元素行（如 毒素、爆炸）/ 总计。
-   ⚠ **合成元素行**（形如「爆炸（火+冰）144」「腐蚀（电+毒）」「病毒（冰+毒）」
+   ⚠ **合成元素行**（行名形如「爆炸（火+冰）」「腐蚀（电+毒）」「病毒（冰+毒）」
    「磁力」「辐射」「毒气」）**必须读出来**：括号里是合成它的两种基础元素，
-   前面的数值（如 144）要照抄 —— 这一行最常被整行漏掉。
-   数字里的千分位逗号
-   （如 1,807.3）原样保留；若某行是「旧值>新值」形式就两个都给。
+   括号后的那个数要照抄 —— 这一行最常被整行漏掉。
+   数字里的千分位逗号原样保留；若某行是「旧值>新值」形式就两个都给。
    行名必须与数值严格对齐（不要串行）；「总计」是独立的一行，它的数值
    约等于上面所有行之和 —— 不要把总计的数值写到别的行名下，也不要
    凭空新增图中没有的行（图里没有「爆炸」就不要输出爆炸行）。
@@ -109,9 +113,10 @@ VISION_PROMPT = """这是 Warframe（星际战甲）游戏内武器升级界面�
 4. 看不清的内容填 null，不要猜。
 5. 面板数值块在「伤害」栏**上方**，从上到下：暴击几率 / 暴击伤害 /
    触发几率 —— 每行都是「基础值 ▶ MOD后值」两个数（红色左值、绿色右值）。
-   **一律取 ▶ 右边的 MOD 后值**（如「22% ▶ 138%」要填 138%，不是 22%）；
-   暴击伤害的「倍」字保留。暴击几率常带小数（如 75.6%），触发几率是
-   个位数十位数的小百分数（如 10%），两行别看串。
+   左上「射击速度 / 攻击速度」行同理，也取 ▶ 右边的 MOD 后值。
+   **一律取 ▶ 右边的 MOD 后值**（不是左边的那个基础值）；
+   暴击伤害的「倍」字保留。暴击几率常带小数，触发几率通常是
+   个位数十位数的小百分数，两行别看串。
 6. 容量数字的 color 只看**数字本身**的颜色（绿/红/白）—— 数字旁边
    的极性符号（V/—/D 等）自带的颜色不是数字颜色，别搞混。
 """
@@ -193,8 +198,60 @@ def clean_weapon_name(s) -> str:
     return t.strip(" +·|/／").strip()
 
 
+def _balance_brackets(s: str) -> str:
+    """就地修复缺失/多余的收尾括号（模型少写 ``]`` 的常见笔误，字符串字面量内不算）。
+
+    2026-10-05 识图测试实证：30B 对裁剪图（无卡框）吐出
+    ``…"negative": [["装填速度", 23.3]}`` —— 少一个 ``]``，json.loads 直接失败，
+    weapon 全丢（而窄读词条是全对的）。⇒ 扫描时遇到与栈顶不匹配的闭合符，
+    **先把缺的收尾插在它前面**再收当前；多余闭合符直接丢弃；结尾按栈逆序补齐。
+    """
+    out: list = []
+    stack: list = []
+    pairs = {"]": "[", "}": "{"}
+    closer = {"[": "]", "{": "}"}
+    in_str = esc = False
+    for ch in s:
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            continue
+        if ch in "[{":
+            stack.append(ch)
+            out.append(ch)
+            continue
+        if ch in "]}":
+            want = pairs[ch]
+            if stack and stack[-1] == want:
+                stack.pop()
+                out.append(ch)
+                continue
+            if stack:
+                while stack and stack[-1] != want:
+                    out.append(closer[stack.pop()])
+                if stack and stack[-1] == want:
+                    stack.pop()
+                    out.append(ch)
+                # 栈空仍不匹配 ⇒ 多余闭合符，丢弃
+            # 栈空 ⇒ 多余闭合符，丢弃
+            continue
+        out.append(ch)
+    while stack:
+        out.append(closer[stack.pop()])
+    return "".join(out)
+
+
 def parse_vision_json(text: str) -> dict:
-    """从模型输出里抠出 JSON（容忍思考段、markdown 代码块与前后废话）。
+    """从模型输出里抠出 JSON（容忍思考段、markdown 代码块、前后废话、缺收尾括号）。
 
     注意 thinking 类模型（glm-4.1v-thinking-flash）会先吐一段 ``<think>…</think>``，
     里面可能含花括号，必须先剥掉再取 JSON。
@@ -208,13 +265,13 @@ def parse_vision_json(text: str) -> dict:
     i, j = s.find("{"), s.rfind("}")
     if i >= 0 and j > i:
         s = s[i : j + 1]
-    for candidate in (s, re.sub(r",\s*([}\]])", r"\1", s)):
+    for candidate in (s, re.sub(r",\s*([}\]])", r"\1", s), _balance_brackets(s)):
         try:
             d = json.loads(candidate)
-            if isinstance(d, dict):
-                return d
         except Exception:  # noqa: BLE001
             continue
+        if isinstance(d, dict):
+            return d
     return {}
 
 
@@ -270,6 +327,23 @@ def match_mod(query: str) -> tuple[Optional[dict], str]:
     near = difflib.get_close_matches(q, list(norm_map), n=1, cutoff=0.72)
     if near:
         return norm_map[near[0]], "近似"
+    # 同族兜底：「前缀 + 空格 + 词」的族名卡（镀层/赤毒/Prime…）OCR 错两字时
+    # 全局相似度会掉到 0.72 以下（2026-10-09 实测「镀层 氚晶猫具」= 0.667）。
+    # 只在**同前缀、同长度**的候选里放宽到 0.6，且第一名须领先第二名 0.15 ——
+    # 族内其它卡与之相似度只剩前缀那点，不会被误吸
+    raw = str(query or "").strip()
+    if " " in raw:
+        pre = _norm(raw.split()[0])
+        fam = [k for k in norm_map if k.startswith(pre) and len(k) == len(q)]
+        scored = sorted(
+            ((difflib.SequenceMatcher(None, q, k).ratio(), k) for k in fam), reverse=True
+        )
+        if (
+            scored
+            and scored[0][0] >= 0.6
+            and (len(scored) < 2 or scored[0][0] - scored[1][0] >= 0.15)
+        ):
+            return norm_map[scored[0][1]], "同族近似"
     return None, ""
 
 
@@ -479,12 +553,20 @@ def _panel_base_weapon(weapon: dict, panel: dict, totals: dict) -> tuple[Optiona
         rev.setdefault(str(_zh), _k)
     base_dmg: dict[str, float] = {}
     elem_rows: list[tuple[str, float]] = []
+    unmatched: list[tuple[str, float]] = []  # 行名认不出但有数值的行（★不许静默丢）
+    notes: list[str] = []  # 反推过程的非致命事件，随 note 上卡面
     for row in panel.get("damage_rows") or []:
         if not isinstance(row, (list, tuple)) or len(row) < 2:
             continue
         label = str(row[0]).lstrip("*").strip()
         key = next((k for zh, k in rev.items() if label.startswith(zh)), None)
         if not key:
+            if label in ("总计", "总伤害", "总"):
+                continue  # 总计行由 _panel_total 专门读取，不是「认不出的行」
+            _l0, _r0 = to_pair(row[1])
+            _v0 = float(_r0 or _l0 or 0.0)
+            if _v0 > 0:
+                unmatched.append((label or "（空行名）", _v0))
             continue
         left, right = to_pair(row[1])
         if not left:
@@ -506,12 +588,85 @@ def _panel_base_weapon(weapon: dict, panel: dict, totals: dict) -> tuple[Optiona
     lib_total = float(lib_dmg.get("total") or 0.0) or sum(
         float(lib_dmg.get(k) or 0.0) for k in ("impact", "puncture", "slash")
     )
+    # 灵化形态库提前加载（wfsim 数据源）：元素反解的幻影防线也要看它有没有该元素
+    inc = _incarnon_forms().get(str(weapon.get("uniqueName") or "").lower())
+    inc_dmg = (inc or {}).get("damage") or {}
+    inc_total = float(inc_dmg.get("total") or 0.0)
+
+    # ★★ 2026-10-09 物理行串行纠正：模型偶发把相邻两行的行名与数值对错位
+    #   （实测拉特昂 Prime：面板「冲击 9▸25.4 / 穿刺 72▸203.5」被读成
+    #   冲击 203.5、穿刺 25.4 ⇒ 反推基础冲击 76.8，吃 G 系冲击弱点致单发虚高）。
+    #   判据（与具体武器无关）：反推三系与库内/灵化库的分布**对不上**，而它的
+    #   某个排列**对得上**（各行 ÷ 参照同行的比值彼此相差 ≤3%）⇒ 按该排列纠正。
+    #   两者都对不上时不动（可能是真的改了构成的形态，交给后面的校验）。
+    def _fits(cand: dict, ref: dict) -> bool:
+        if not cand or any(float(ref.get(k) or 0.0) <= 0 for k in cand):
+            return False
+        _r = [cand[k] / float(ref[k]) for k in cand]
+        return max(_r) - min(_r) <= 0.03 * max(_r)
+
+    _phys_read = {k: base_dmg[k] for k in PHYS_ZH if k in base_dmg}
+    _refs = [d for d in (lib_dmg, inc_dmg) if any(float(d.get(k) or 0.0) > 0 for k in PHYS_ZH)]
+    if (
+        len(_phys_read) >= 2
+        and len(set(round(v, 3) for v in _phys_read.values())) >= 2
+        and _refs
+        and not any(_fits(_phys_read, r) for r in _refs)
+    ):
+        _ks = list(_phys_read)
+        for _perm in itertools.permutations(_phys_read.values()):
+            _cand = dict(zip(_ks, _perm))
+            if _cand != _phys_read and any(_fits(_cand, r) for r in _refs):
+                _moved = [k for k in _ks if _cand[k] != _phys_read[k]]
+                base_dmg.update(_cand)
+                notes.append(
+                    "面板"
+                    + "/".join(PHYS_ZH[k] for k in _moved)
+                    + "行的数值疑似串行（按库内伤害构成对调后吻合），已纠正"
+                )
+                break
+
+    # ★★ 2026-10-05 锚定补全（库内有基础时只反推一个缩放锚）：
+    #   IPS 三系里「库内有值、反推却缺失」的类型 —— 典型：面板行名被遮挡
+    #   （实测执法者穿刺行被滚动箭头盖住 → 整行静默丢 → 本地推算少 102.3、
+    #   毒素行反解出幻影自带毒 29）。用「已反推行 ÷ 库内同行」的中位锚补全：
+    #   锚 = 基伤 MOD × 灵化进化系数（全类型一致），各行锚应自洽。
+    #   执法者实测两锚同为 310/210 ≈ 1.476，补出穿刺 46.5 → 面板 102.3 逐行吻合。
+    if base_dmg:
+        _lib_phys = {k: float(lib_dmg.get(k) or 0.0) for k in PHYS_ZH}
+        _missing = [k for k in PHYS_ZH if k not in base_dmg and _lib_phys.get(k, 0.0) > 0]
+        _anchors = sorted(
+            base_dmg[k] / _lib_phys[k]
+            for k in base_dmg
+            if k in PHYS_ZH and _lib_phys.get(k, 0.0) > 0
+        )
+        if _missing and _anchors:
+            _scale = _anchors[len(_anchors) // 2]
+            _lo, _hi = _anchors[0], _anchors[-1]
+            if _hi - _lo > 0.02 * max(_hi, _lo):
+                notes.append(f"各行反推锚不一致（{_lo:.3f}~{_hi:.3f}），按中位锚 {_scale:.3f} 补全")
+            for k in _missing:
+                base_dmg[k] = _lib_phys[k] * _scale
+            notes.append(
+                "面板"
+                + "、".join(PHYS_ZH[k] for k in _missing)
+                + "行未读到（行名被遮挡或漏读），已按库内比例补全 "
+                + "、".join(f"{PHYS_ZH[k]} {_lib_phys[k] * _scale:.1f}" for k in _missing)
+            )
+    if unmatched:
+        notes.append(
+            "面板行 "
+            + "、".join(f"「{lb}」{v:g}" for lb, v in unmatched)
+            + " 行名未能归属类型（图标遮挡？），已按库内分布对账"
+        )
     if base_dmg:
         ips_total = sum(v for k, v in base_dmg.items() if k in ("impact", "puncture", "slash"))
         # 总伤锚定：某行值≈面板总伤（可能是被模型挂错行名的「总计」）时，
         # 不许它进自带元素反推 —— 否则基础总伤直接翻倍（实测踩过）
         pan_total = _panel_total(panel)
-        # 元素行 → 自带元素基础（灵化形态普遍改自带元素，如执法者灵化的毒素）。
+        # 元素行 → 自带元素基础（灵化形态可能改自带元素 —— ⚠ 2026-10-05 实证：
+        #   执法者「自带毒 29」其实是穿刺行被遮挡造成的**幻影**，执法者并无
+        #   自带毒素；判定与防线见下）。
         # 我们引擎的语义：元素 MOD 加成 = 元素%×MOD后总基础（含自带元素），即
         #   行值 = after_base×(E0 + pct×(IPS总+E0))
         # → E0 = (行值/after_base − pct×IPS总) / (1+pct)
@@ -519,20 +674,25 @@ def _panel_base_weapon(weapon: dict, panel: dict, totals: dict) -> tuple[Optiona
         composed = dc.compose_elements(dict(totals.get("elements") or {}))
         for key, row_v in elem_rows:
             if pan_total and abs(row_v - pan_total) / pan_total < 0.02:
-                continue  # 这是「总计」行（行名被模型挂错了），跳过
+                # 这是「总计」行（行名被模型挂错了），跳过 —— 上卡面说明：
+                # 该元素改按 MOD 推算，别让用户以为面板那一行被采信了
+                notes.append(
+                    f"面板「{ELEM_ALL_ZH.get(key, key)}」行读数 {row_v:g} ≈ 总计，"
+                    "疑似误抄总计，该元素按 MOD 推算"
+                )
+                continue
             pct = float(composed.get(key) or 0.0) / 100.0
             e0 = (row_v / bd_m - pct * ips_total) / (1 + pct)
             # 幻影自带元素防线：游戏面板行值与「纯 MOD 解释值」有未建模的
             # 小偏差（实测拉特昂 Prime 面板各行有 ~+6.7% 的显示系数），
             # 逆解后会得到占总量百分之几的幽灵自带元素 → 基础总伤虚高、
             # 总伤校验 ⚠。MOD 已能解释行值 90% 以上时视为无自带元素。
-            # （真实自带元素远大于此：执法者灵化毒素占行值 ~24%）
             explained = bd_m * pct * ips_total  # 纯 MOD 贡献
             if pct > 0 and row_v - explained < 0.10 * row_v:
                 continue
             # 疑似总计行兜底②：无该元素 MOD、库内基础也没有它、而反推出的
-            # 自带值却 ≥ IPS 总量的 2 倍 —— 真实自带元素极少这么大（执法者
-            # 灵化毒素才 1.65×IPS），大概率是「总计」被挂错了行名（实测踩过）
+            # 自带值却 ≥ IPS 总量的 2 倍 —— 真实自带元素极少这么大，大概率是
+            # 「总计」被挂错了行名（实测踩过）
             if (
                 pct == 0.0
                 and not float(lib_dmg.get(key) or 0.0)
@@ -540,12 +700,19 @@ def _panel_base_weapon(weapon: dict, panel: dict, totals: dict) -> tuple[Optiona
                 and e0 >= 2.0 * ips_total
             ):
                 continue
+            # ★ 幻影防线③（2026-10-05）：库内基础与灵化形态**都没有**该元素时，
+            #   反解出的「自带元素」必是缺行/噪声的假象 —— 实测执法者：穿刺行
+            #   被遮挡 → IPS 少 46.5 → 反解出幻影自带毒 29（真值 0，毒 100% 来自
+            #   热病打击 Prime；上面的锚定补全 + 本防线双保险）。
+            if e0 > 0 and not float(lib_dmg.get(key) or 0.0) and not float(inc_dmg.get(key) or 0.0):
+                notes.append(
+                    f"反解出幻影自带{ELEM_ALL_ZH.get(key, key)} {e0:g}"
+                    "（库内/灵化库均无此自带元素）→ 判 0"
+                )
+                continue
             if e0 > 0:
                 base_dmg[key] = e0
-    # wfsim 灵化形态数值（有就是权威判定 + 更准的兜底向量）
-    inc = _incarnon_forms().get(str(weapon.get("uniqueName") or "").lower())
-    inc_dmg = (inc or {}).get("damage") or {}
-    inc_total = float(inc_dmg.get("total") or 0.0)
+    # wfsim 灵化形态数值（有就是权威判定 + 更准的兜底向量）—— 已提前加载（见上）
 
     if not base_dmg:
         # 兜底：类型行没读到（模型偶发 damage_rows 为空）但总计有值
@@ -577,6 +744,27 @@ def _panel_base_weapon(weapon: dict, panel: dict, totals: dict) -> tuple[Optiona
 
     base_dmg = {k: _snap(v) for k, v in base_dmg.items()}
     base_total = _snap(sum(base_dmg.values()))
+    # ★ 2026-10-05 灵化对账（修复④）：反推总量高于库内的差额若与 evolutions.json
+    #   的 flat_base_damage 吻合（实测执法者 310−210＝100），明说「灵化 +100 已计入」，
+    #   不再让用户对着 47.6% 的差值猜。键 = 英文名小写下划线（Magistar → magistar）。
+    if base_total > lib_total > 0:
+        _evo_key = str(weapon.get("name") or "").strip().lower().replace(" ", "_")
+        _evo_tiers = (dc._load_evo_data()[0].get(_evo_key) or {}).get("tiers") or {}
+        _flat = 0.0
+        for _opts in _evo_tiers.values():
+            _vals = [
+                float(_e.get("value") or 0.0)
+                for _o in _opts
+                for _e in (_o.get("effects") or [])
+                if _e.get("kind") == "flat_base_damage"
+            ]
+            if _vals:
+                _flat += max(_vals)  # choose_one：取该档最高（执法者两选项同为 +100）
+        if _flat > 0 and abs((base_total - lib_total) - _flat) <= 0.05 * max(lib_total, 1.0):
+            notes.append(
+                f"反推基础 {base_total:g} ＝ 库内 {lib_total:g} ＋ 灵化进化 +{_flat:g}"
+                "（与 evolutions 数据吻合，已计入）"
+            )
     diffs = [abs(base_total - lib_total) / max(lib_total, 1.0)]
     if cc_p is not None:
         # ⚠️ 面板是百分数、库里是小数：反推后先 /100 再比，否则必然误触发覆盖
@@ -595,6 +783,8 @@ def _panel_base_weapon(weapon: dict, panel: dict, totals: dict) -> tuple[Optiona
     # ---- 灵化库命中：面板反推值与灵化基础吻合 → 直接采用灵化基础 ----
     # （基础是真实库数据，MOD 正常叠算，面板校验也保持开启；
     #   反推值里吸收的灵化进化 perk 平坦加成会导致小偏差，20% 容差内即可）
+    _extra = "；".join(notes)
+
     if inc_total > 0:
         diffs_inc = [abs(base_total - inc_total) / max(inc_total, 1.0)]
         if cc_p is not None:
@@ -618,12 +808,17 @@ def _panel_base_weapon(weapon: dict, panel: dict, totals: dict) -> tuple[Optiona
             w2["procChance"] = float(inc.get("procChance") or 0.0)
             if float(inc.get("fireRate") or 0.0) > 0:
                 w2["fireRate"] = float(inc["fireRate"])
+            dc.set_form_cadence(w2, inc)  # 点射 / 蓄力随灵化形态（b6 批）
             return w2, (
                 "灵化形态：基础数值取自灵化库（wfsim 数据源），MOD 正常叠算，面板校验保持开启"
+                + ("；" + _extra if _extra else "")
             )
 
     w2 = dict(weapon)
     w2["damage"] = {**base_dmg, "total": base_total}
+    # 基础取自截图面板（只是面板当前那一种攻击）→ 伤害卡不再按库内 attacks
+    # 标「本表基础伤害含多段合并」（键名与 damage_calc.card_lines 约定）
+    w2["_panel_derived"] = True
     if cc_p is not None:
         w2["criticalChance"] = round(cc_p / cc_m / 100.0, 4)  # 面板百分数→库小数
     if cm_p is not None:
@@ -637,6 +832,8 @@ def _panel_base_weapon(weapon: dict, panel: dict, totals: dict) -> tuple[Optiona
     fr = to_float(panel.get("attack_speed"))
     if fr is not None:
         w2["fireRate"] = fr
+        # 标记「射速取自面板终值」→ to_damage_spec 据此**不再**叠射速 MOD（防二次加成）
+        w2[FIRE_RATE_FROM_PANEL] = True
     names = _incarnon_names()
     is_inc = (
         inc_total > 0
@@ -650,13 +847,33 @@ def _panel_base_weapon(weapon: dict, panel: dict, totals: dict) -> tuple[Optiona
         return w2, (
             "灵化/回响武器：基础数据从面板反推（含回响加成与进化加成，"
             "回响为 25-60% 随机值，实际以游戏内为准），"
-            "MOD 按实际等级正常叠算一次"
+            "MOD 按实际等级正常叠算一次" + ("；" + _extra if _extra else "")
         )
-    return w2, (
-        "灵化形态：基础数据从面板反推（含自带元素与灵化进化加成），MOD 按实际等级正常叠算一次"
-        if is_inc
-        else "特殊形态：基础数据从面板反推，MOD 按实际等级正常叠算一次"
+    # 物理构成与库内（普通形态）同比例、且没有反推出自带元素 ⇒ 这是普通形态
+    # 带灵化进化的面板（进化只平坦抬基伤/暴击），不是灵化形态 —— 别标错
+    _phys_now = {k: base_dmg[k] for k in PHYS_ZH if base_dmg.get(k)}
+    _evo_only = (
+        is_inc
+        and _fits(_phys_now, lib_dmg)
+        and not any(k not in PHYS_ZH and v > 0 for k, v in base_dmg.items())
     )
+    if _evo_only:
+        _base_note = "普通形态（含灵化进化加成）：基础数据从面板反推，MOD 按实际等级正常叠算一次"
+    elif is_inc:
+        _base_note = (
+            "灵化形态：基础数据从面板反推（含自带元素与灵化进化加成），MOD 按实际等级正常叠算一次"
+        )
+    else:
+        _base_note = "特殊形态：基础数据从面板反推，MOD 按实际等级正常叠算一次"
+    if is_inc and not _evo_only and inc:
+        dc.set_form_cadence(w2, inc)  # 面板是灵化形态 ⇒ 点射 / 蓄力随灵化（b6 批）
+    return w2, _base_note + ("；" + _extra if _extra else "")
+
+
+# 武器 dict 上的私有标记键：fireRate 已被面板「攻速」行（终值）覆盖
+FIRE_RATE_FROM_PANEL = "_fire_rate_from_panel"
+# 面板上「基础 ▸ MOD 后」两列的标量行（analyze 入口统一归一为右列）
+_PANEL_SCALARS = ("attack_speed", "crit_chance", "crit_damage", "status_chance")
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +1066,15 @@ def analyze(ocr: dict, pips_rows: Optional[list] = None) -> dict:
             _fixed.append(_r)
     if _fixed:
         _panel["damage_rows"] = _fixed
+    # ---- 面板标量归一：两列都给时一律取右列（MOD 后终值）----
+    # 升级界面每行是「基础 ▸ MOD 后」两列；提示词要求只给右列，但模型常把两列
+    # 一起给（"22% ▸ 138%" / ["4.17", "3.33"]），而下游 to_float 取**第一个**数
+    # ⇒ 把基础值当终值：反推基础被多除一次 MOD、射速还会被打上「取自面板」而跳过
+    # 射速 MOD（2026-10-09 修，拉特昂 Prime 截图实测口径）。单值保持原样。
+    for _k in _PANEL_SCALARS:
+        _l, _r = to_pair(_panel.get(_k))
+        if _l is not None and _r is not None:
+            _panel[_k] = _r
     _tot = _panel.get("total")
     if isinstance(_tot, (list, tuple)) and len(_tot) >= 3 and to_float(_tot[2]) is not None:
         _panel["total"] = [str(_tot[0]), f"{_tot[1]}>{_tot[2]}"]
@@ -884,7 +1110,16 @@ def analyze(ocr: dict, pips_rows: Optional[list] = None) -> dict:
     # ---- 逐卡识别 ----
     totals: dict = {k: 0.0 for k in _ADD_FIELDS}
     totals.update(
-        {"elements": {}, "physical": {}, "uncalc": [], "no_rank": [], "throw_max_stacks": 0}
+        {
+            "elements": {},
+            "physical": {},
+            "uncalc": [],
+            "no_rank": [],
+            "throw_max_stacks": 0,
+            # 派系卡（灭亡/歼灭类）按派系分桶：{派系名: 百分比}（2026-10-06 同
+            # damage_calc 口径：不再折进通用 faction_dmg 打任意派系都生效）
+            "faction_dmg_of": {},
+        }
     )
     for _mi, raw in enumerate(out["raw_mods"]):
         if not isinstance(raw, dict):
@@ -952,6 +1187,8 @@ def analyze(ocr: dict, pips_rows: Optional[list] = None) -> dict:
             if not eff:
                 totals["uncalc"].append(item.get("zh") or name)
             for key in _ADD_FIELDS:
+                if key == "faction_dmg" and eff.get("faction_of"):
+                    continue  # 派系卡走 faction_dmg_of 分桶，不进通用桶
                 if eff.get(key):
                     totals[key] += float(eff[key])
             # 斩铁：「重击时 x2」→ 重击的暴击几率加成额外再吃一份
@@ -962,12 +1199,27 @@ def analyze(ocr: dict, pips_rows: Optional[list] = None) -> dict:
                 totals["throw_max_stacks"] = max(
                     int(totals["throw_max_stacks"]), int(eff["throw_max_stacks"])
                 )
+            # 派系卡按派系分桶（倍率写法 x1.55 与百分比写法都折成百分点）
+            _fac_of = str(eff.get("faction_of") or "")
+            if _fac_of:
+                _fac_pct = (
+                    (float(eff["faction_mul"]) - 1) * 100
+                    if eff.get("faction_mul")
+                    else float(eff.get("faction_dmg") or 0.0)
+                )
+                if _fac_pct:
+                    totals["faction_dmg_of"][_fac_of] = (
+                        totals["faction_dmg_of"].get(_fac_of, 0.0) + _fac_pct
+                    )
             for el, val in (eff.get("elements") or {}).items():
+                if el in ("impact", "puncture", "slash"):
+                    # 数据层历史双写：物理类型只走 physical 通道，防重复折算
+                    continue
                 totals["elements"][el] = totals["elements"].get(el, 0.0) + float(val)
             for el, val in (eff.get("physical") or {}).items():
                 totals["physical"][el] = totals["physical"].get(el, 0.0) + float(val)
         else:
-            # ★ 裂罅紫卡（2026-09-20 用户方案文档 TC-04）：名字由「武器名 + 随机词缀」
+            # ★ 裂罅紫卡（2026-09-20 方案文档 TC-04）：名字由「武器名 + 随机词缀」
             #   组成（如「野猪 Visi-satidex」），**不可能**在静态词典里全字匹配。
             #   以前它会被当成「库中未收录」—— 那是误导（不是我们缺数据，是它本来随机）。
             #   这里单独识别出来：数值无法核算（词缀随机），但**等级仍能从豆子读**。
@@ -1082,8 +1334,13 @@ def analyze(ocr: dict, pips_rows: Optional[list] = None) -> dict:
             dr=0.0,
             viral_mult=1.0,
             mag_mult=1.0,
+            # 军械库面板显示的是**量化前**的值（Xoris 截图「总计 156>264」= 未量化和），
+            # 对拍面板就不能量化；实战伤害（calculate）照常量化
+            quantize=False,
         )
         out["calc_panel"]["total"] = sum(_pt.values())
+        # 分类型结算（含基伤乘区）：行和自检据此判断「识别行 ≈ 纯物理」并补合成元素
+        out["calc_panel"]["by_type"] = dict(_pt)
     # 条件暴击卡（镀层瞄具族）：游戏面板暴击率显示似乎含条件加成 → 跳过该项校验
     _cond_crit = any(
         "critical" in json.dumps(m.get("effect") or {}, default=str).lower()
@@ -1239,8 +1496,7 @@ def _panel_checks(
             rev = {}
             for _k, _zh in {**PHYS_ZH, **ELEM_ALL_ZH}.items():
                 rev.setdefault(str(_zh), _k)
-            s = 0.0
-            n_rows = 0
+            vals_rows: list[float] = []
             for row in rows:
                 if not isinstance(row, (list, tuple)) or len(row) < 2:
                     continue
@@ -1255,8 +1511,15 @@ def _panel_checks(
                 _l, _r = to_pair(vals[-1] if vals else None)
                 v = _r if _r else _l
                 if v:
-                    s += float(v)
-                    n_rows += 1
+                    vals_rows.append(float(v))
+            # 值 ≈ 总计的伤害行 = 模型把「总计」挂到了别的行名下（与 _panel_base_weapon
+            # 的反推同口径跳过）；只在其余行确有数值时剔除 —— 单一类型且多重 1 的
+            # 武器，那一行本来就等于总计
+            _rest = [v for v in vals_rows if abs(v - tot_v) / tot_v >= 0.02]
+            if len(_rest) < len(vals_rows) and sum(_rest) >= 0.02 * tot_v:
+                vals_rows = _rest
+            s = sum(vals_rows)
+            n_rows = len(vals_rows)
             if n_rows >= 2:
                 # 行和自检 = 识别到的伤害行 + **本地推算的合成元素**（补齐）
                 #
@@ -1269,8 +1532,16 @@ def _panel_checks(
                 #
                 # 只在「识别行和 ≈ 纯物理和」时补（模型读全时 s 已含元素，
                 # 再补会双计）。
-                _phys = sum(float(v) for v in (calc.get("physical") or {}).values())
-                _elem = float(calc.get("element_damage") or 0.0)
+                _bt = calc.get("by_type")
+                if _bt:
+                    # 引擎同款结算（含基伤 MOD）—— _calc_panel 的 physical/element
+                    # 不乘基伤乘区，配了膛线类就永远判不成「≈纯物理」（2026-10-09
+                    # 拉特昂 Prime 实测：推算物理 96 vs 识别 254.3，合成病毒补不进来）
+                    _phys = sum(float(v) for k, v in _bt.items() if k in PHYS_ZH)
+                    _elem = sum(float(v) for k, v in _bt.items() if k not in PHYS_ZH)
+                else:
+                    _phys = sum(float(v) for v in (calc.get("physical") or {}).values())
+                    _elem = float(calc.get("element_damage") or 0.0)
                 _full = s
                 if _elem > 0.5 and abs(s - _phys) <= max(_phys * 0.05, 0.5):
                     _full = s + _elem
@@ -1378,11 +1649,13 @@ def _effect_text(eff: dict) -> str:
         val = eff.get(key)
         if val:
             unit = "" if key in ("punch_through", "initial_combo") else "%"
-            bits.append(f"{label}+{val:g}{unit}")
+            bits.append(f"{label}{val:+g}{unit}")
     for el, val in (eff.get("elements") or {}).items():
-        bits.append(f"{ELEM_ALL_ZH.get(el, el)}+{val:g}%")
+        if el in ("impact", "puncture", "slash"):
+            continue  # 物理类型在下一行 physical 里显示，别重复一条
+        bits.append(f"{ELEM_ALL_ZH.get(el, el)}{val:+g}%")
     for el, val in (eff.get("physical") or {}).items():
-        bits.append(f"{PHYS_ZH.get(el, el)}+{val:g}%")
+        bits.append(f"{PHYS_ZH.get(el, el)}{val:+g}%")
     if eff.get("faction_mul"):
         bits.append(f"派系×{eff['faction_mul']:g}")
     return "、".join(bits)
@@ -1422,6 +1695,8 @@ def to_damage_spec(an: dict, level: int = 100, faction: str = "Grineer") -> Opti
             "dmg_per_status": float(t.get("dmg_per_status") or 0.0),
             "singles": {k: float(v) for k, v in (t.get("elements") or {}).items()},
             "physical": {k: float(v) for k, v in (t.get("physical") or {}).items()},
+            # 派系卡分桶 → calculate 按最终派系取用（与 parse_args 同构）
+            "faction_dmg_of": [[f, float(p)] for f, p in (t.get("faction_dmg_of") or {}).items()],
         }
     )
     # 反推路径的基础是「把 MOD 除回去」的净基础（v1.11 修正：此前误把 MOD
@@ -1430,13 +1705,37 @@ def to_damage_spec(an: dict, level: int = 100, faction: str = "Grineer") -> Opti
     # 这里不再对 spec 做任何零化。
     if t.get("heavy_dmg") or t.get("initial_combo"):
         spec["heavy"] = True  # 配了重击类 MOD 就顺便给重击数据
+    # ★ 射速 MOD（2026-10-09 修：此前 totals.fire_rate 从未进 spec ⇒ 识卡 DPS 漏算射速，
+    #   带「+射速 −基伤」的卡反而让 DPS 变低）。只在 fireRate **不是**面板终值时叠加：
+    #   · 依据【实测·2026-10-09】拉特昂 Prime 配关键延迟（−20% 射速）的升级界面截图：
+    #     「射击速度 4.17 ▸ 3.33」，库基础 4.166667 × 0.8 = 3.3333 ⇒ 攻速行右列 = 已含 MOD
+    #     的终值（与执法者截图 暴击 75.6% vs 基础 20%、冲击 545.6 vs 168 的结论一致）。
+    #     两条路径取同一值：读到面板 3.33 → 直接用、不叠；没读到 → 基础 × (1 − 20%)。
+    #     守卫：tests/test_loadout_ocr.py「拉特昂 Prime 截图：…两条路径同值」。
+    #   · 判据按「射速来源」而非「是否走了面板反推」：反推分支没读到攻速行、或灵化库直采
+    #     分支，fireRate 仍是基础值（实例：拉特昂 Prime 反推但无攻速行，关键延迟 −20% 须计入）。
+    #   · 两列取值：模型若把「基础 ▸ 终值」两列一起给，analyze 入口已统一归一为右列
+    #     （_PANEL_SCALARS），这里拿到的 attack_speed 一定是终值。
+    w = an.get("weapon") or {}
+    if not w.get(FIRE_RATE_FROM_PANEL):
+        spec["fire_rate_pct"] = float(t.get("fire_rate") or 0.0)
+        # totals.fire_rate 来自 MOD 库值（卡面的步枪值）⇒ 全部算「射速 MOD」部分，
+        # 弓/弩由 calculate 翻倍（面板终值分支不进这里，不会重复翻倍）
+        spec["fire_rate_mod_pct"] = spec["fire_rate_pct"]
     return spec
 
 
 def card_lines(an: dict) -> list[str]:
-    """识别结果卡面。"""
+    """识别结果卡面。
+
+    行文法（2026-10-11 卡片改版）：卡首 KV（武器 / 识别 / 折算加成 / 参考）→ 武器面板 →
+    卡片表（名称｜容量与等级｜效果）→ 面板校验表 → ⚠ 警示与注脚（≤3 行）。
+    """
+    from .formatters import limit_notes
+
     lines: list[str] = []
     w = an.get("weapon")
+    panel_rows: list[str] = []
     if w:
         dmg = w.get("damage") or {}
         parts = "、".join(
@@ -1448,45 +1747,30 @@ def card_lines(an: dict) -> list[str]:
         lines.append(
             f"◆ 武器：{w.get('zh') or w['name']}（{w['name']}）｜{cat}｜MR{w.get('masteryReq', 0)}"
         )
-        if an.get("panel_base"):
-            lines.append(f"　{an['panel_base']}")
-        lines.append(
-            f"　基础 {parts}（计 {float(dmg.get('total') or 0):g}）"
+        panel_rows.append(
+            f"· 基础　{parts}（计 {float(dmg.get('total') or 0):g}）"
             f"｜暴击 {float(w.get('criticalChance') or 0) * 100:g}%"
             f"×{float(w.get('criticalMultiplier') or 1):g}"
             f"｜触发 {float(w.get('procChance') or 0) * 100:g}%"
         )
+        if an.get("panel_base"):
+            panel_rows.append(f"· 面板　{an['panel_base']}")
     else:
         lines.append(f"◆ 武器：未能识别（读到的是「{an.get('weapon_query') or '空'}」）")
 
+    # —— 面板校验结论（先算好，卡首「识别」行引用）——
+    checks = an.get("checks") or []
+    _tips = [c for c in checks if c.get("note")] if checks else []
+    if checks:
+        # 带 note 的项是「说明性提示」（如面板总计读串），不参与 ✓/⚠ 对比
+        checks = [c for c in checks if not c.get("note")]
+    bad = [c for c in checks if not c["ok"]]
+    verdict = ""
+    if checks:
+        verdict = "｜面板校验 " + ("全部吻合" if not bad else f"{len(bad)} 项对不上")
+
     cap = f"｜容量 {an['capacity']}" if an.get("capacity") else ""
-    lines.append(f"◆ 识别到 {len(an.get('mods') or [])} 张卡{cap}")
-    for item in an.get("mods") or []:
-        if not item.get("found"):
-            if item.get("riven"):
-                # 紫卡是**合法但无法核算**的卡（词缀随机）—— 单独一行说清楚，
-                # 不要混进「库中未收录」里（那会让人以为是我们缺数据）。
-                r = item.get("rank")
-                lines.append(
-                    f"　· {item.get('raw')}：裂罅紫卡（词缀随机，数值无法核算）"
-                    + (f"，等级按豆子 {r} 级" if r is not None else "")
-                )
-            else:
-                lines.append(f"　· {item.get('raw')}：⚠ 库中未收录，已忽略")
-            continue
-        name = item.get("zh") or item.get("name")
-        en = item.get("name") or ""
-        tail = _effect_text(item.get("effect") or {})
-        line = f"　· {name}（{en}）{_rank_text(item)}"
-        if tail:
-            line += f" → {tail}"
-        elif not item.get("calculable"):
-            line += " → 无数值（不影响伤害）"
-        elif item.get("rank") is None:
-            line += " → ⚠ 等级未定，按满级估"
-        if item.get("note"):
-            line += f"；{item['note']}"
-        lines.append(line)
+    lines.append(f"◆ 识别：{len(an.get('mods') or [])} 张卡{cap}{verdict}")
 
     totals = an.get("totals") or {}
     bits: list[str] = []
@@ -1501,7 +1785,7 @@ def card_lines(an: dict) -> list[str]:
         ("fire_rate", "射速"),
     ):
         if totals.get(key):
-            bits.append(f"{label}+{totals[key]:g}%")
+            bits.append(f"{label}{totals[key]:+g}%")
     if totals.get("crit_chance_heavy"):
         bits.append(f"重击时暴击率再+{totals['crit_chance_heavy']:g}%")
     if totals.get("throw_dmg"):
@@ -1510,51 +1794,17 @@ def card_lines(an: dict) -> list[str]:
             f"投掷伤害+{totals['throw_dmg']:g}%/层" + (f"（最多{int(_st)}层）" if _st else "")
         )
     for el, val in (totals.get("elements") or {}).items():
-        bits.append(f"{ELEM_ALL_ZH.get(el, el)}+{val:g}%")
+        bits.append(f"{ELEM_ALL_ZH.get(el, el)}{val:+g}%")
     for el, val in (totals.get("physical") or {}).items():
-        bits.append(f"{PHYS_ZH.get(el, el)}+{val:g}%")
+        bits.append(f"{PHYS_ZH.get(el, el)}{val:+g}%")
     if bits:
-        wrapped = _wrap_bits(bits)
-        lines.append("◆ 按实际等级折算的加成：" + wrapped[0])
-        for extra in wrapped[1:]:
-            lines.append("　" + extra)
+        lines.append("◆ 按实际等级折算的加成：" + "、".join(bits))
     combined = totals.get("combined") or {}
     if combined:
         lines.append(
             "◆ 合成后元素："
-            + "、".join(f"{ELEM_ALL_ZH.get(k, k)}+{v:g}%" for k, v in combined.items())
+            + "、".join(f"{ELEM_ALL_ZH.get(k, k)}{v:+g}%" for k, v in combined.items())
         )
-
-    checks = an.get("checks") or []
-    _tips = [c for c in checks if c.get("note")] if checks else []
-    if checks:
-        # 带 note 的项是「说明性提示」（如面板总计读串），不参与 ✓/⚠ 对比
-        checks = [c for c in checks if not c.get("note")]
-    if checks:
-        bad = [c for c in checks if not c["ok"]]
-        head = "全部吻合" if not bad else f"{len(bad)} 项对不上"
-        lines.append(f"◆ 面板校验（识别值 vs 本地推算）—— {head}")
-        for i in range(0, len(checks), 2):
-            parts = []
-            for c in checks[i : i + 2]:
-                got, want = float(c["panel"]), float(c["calc"])
-                # 相对差 <0.1% 视为完全吻合（游戏显示舍入造成的小数残差，
-                # 如 总伤 1488.3 vs 1488.24 —— 差 0.004%，如实显示相等）
-                if c["ok"] and abs(got - want) <= abs(want) * 0.001:
-                    parts.append(f"{c['label']} {got:g}{c['unit']} ✓")
-                else:
-                    parts.append(
-                        f"{c['label']} {got:g}{c['unit']} vs "
-                        f"{want:.2f}{c['unit']}" + ("" if c["ok"] else " ⚠")
-                    )
-            lines.append("　" + "｜".join(parts))
-        if bad:
-            lines.append("　⚠ 可能漏读了卡片，或某张卡的等级推断有误")
-        for c in _tips:
-            lines.append(
-                f"　※ {c['label']}：{c['note']}"
-                f"（识别 {float(c['panel']):g}，推导 {float(c['calc']):.0f}）"
-            )
 
     ref = an.get("ref")
     if ref:
@@ -1571,6 +1821,9 @@ def card_lines(an: dict) -> list[str]:
             extra = ""
             if hv.get("crit_cc") is not None:
                 extra = f"，暴击 {hv['crit_cc'] * 100:.0f}%"
+            if hv.get("initial_combo"):
+                # 初始连击是下限，不与连击数相加（wiki Melee；damage_calc 同口径）
+                extra += f"，初始连击 {hv['initial_combo']} 为下限"
             lines.append(
                 f"　重击（{hv['combo_hits']} 连击{extra}）："
                 f"{hv['health']:.0f}｜含暴击 {hv['health_crit']:.0f}"
@@ -1587,25 +1840,89 @@ def card_lines(an: dict) -> list[str]:
             # 识卡卡面只给摘要：完整各段走「伤害」指令，免得这一页太长
             _top3 = "、".join(f"{m['name']}{m['total']:g}" for m in _modes[:3])
             lines.append(f"　另有 {len(_modes)} 段独立判定：{_top3}…（用「伤害」指令可看每段明细）")
+
+    if panel_rows:
+        lines.append("◆ 武器面板")
+        lines += panel_rows
+
+    # —— 卡片表：名称｜容量与等级｜效果 ——
+    en_pairs: list[str] = []
+    if an.get("mods"):
+        lines.append(f"◆ 卡片（{len(an['mods'])} 张）")
+        lines.append("　卡片　容量与等级　效果")
+    for item in an.get("mods") or []:
+        if not item.get("found"):
+            if item.get("riven"):
+                # 紫卡是**合法但无法核算**的卡（词缀随机）—— 单独一行说清楚，
+                # 不要混进「库中未收录」里（那会让人以为是我们缺数据）。
+                r = item.get("rank")
+                lines.append(
+                    f"· {item.get('raw')}　　裂罅紫卡（词缀随机，数值无法核算）"
+                    + (f"，等级按豆子 {r} 级" if r is not None else "")
+                )
+            else:
+                lines.append(f"· {item.get('raw')}　　⚠ 库中未收录，已忽略")
+            continue
+        name = item.get("zh") or item.get("name")
+        en = item.get("name") or ""
+        tail = _effect_text(item.get("effect") or {})
+        if tail:
+            eff = tail
+        elif not item.get("calculable"):
+            eff = "无数值（不影响伤害）"
+        elif item.get("rank") is None:
+            eff = "⚠ 等级未定，按满级估"
+        else:
+            eff = ""
+        # 英文名不进表格（名称列过宽会让整张表放弃列对齐）：统一进卡尾「英文名对照」注脚
+        if en and en != name:
+            en_pairs.append(f"{name} {en}")
+        lines.append(f"· {name}　{_rank_text(item)}　{eff}".rstrip("　"))
+        if item.get("note"):  # 备注（姿态卡 / 槽位极性匹配…）作为从属行缩进在该卡之下
+            lines.append(f"　{item['note']}")
+
+    # —— 面板校验表 ——
+    if checks:
+        lines.append("◆ 面板校验（识别值 vs 本地推算）")
+        lines.append("　项目　识别值　本地推算　结果")
+        for c in checks:
+            got, want = float(c["panel"]), float(c["calc"])
+            # 相对差 <0.1% 视为完全吻合（游戏显示舍入造成的小数残差，
+            # 如 总伤 1488.3 vs 1488.24 —— 差 0.004%，如实显示相等）
+            if c["ok"] and abs(got - want) <= abs(want) * 0.001:
+                lines.append(f"· {c['label']}　{got:g}{c['unit']}　{got:g}{c['unit']}　吻合")
+            else:
+                lines.append(
+                    f"· {c['label']}　{got:g}{c['unit']}　{want:.2f}{c['unit']}"
+                    + ("　吻合" if c["ok"] else "　⚠ 对不上")
+                )
+        for c in _tips:
+            lines.append(
+                f"· {c['label']}　{float(c['panel']):g}　{float(c['calc']):.0f}　{c['note']}"
+            )
+    if en_pairs:
+        lines.append("※ 英文名对照：" + "、".join(en_pairs))
+    if bad:
+        lines.append("※ ⚠ 可能漏读了卡片，或某张卡的等级推断有误")
     if totals.get("no_rank"):
         lines.append(
-            "　⚠ 等级无法确定的卡：" + "、".join(totals["no_rank"]) + "（已按满级估算，仅供参考）"
+            "※ ⚠ 等级无法确定的卡：" + "、".join(totals["no_rank"]) + "（已按满级估算，仅供参考）"
         )
     if totals.get("uncalc"):
-        lines.append("　注：以下卡无数值或暂不支持，未计入：" + "、".join(totals["uncalc"]))
+        lines.append("※ 以下卡无数值或暂不支持，未计入：" + "、".join(totals["uncalc"]))
     if an.get("unknown"):
-        lines.append("　注：库中未收录的名称：" + "、".join(an["unknown"]))
+        lines.append("※ 库中未收录的名称：" + "、".join(an["unknown"]))
     if an.get("alts"):
         lines.append(
-            "　近似武器：" + "、".join(v.get("zh") or v.get("name", "") for v in an["alts"])
+            "※ 近似武器：" + "、".join(v.get("zh") or v.get("name", "") for v in an["alts"])
         )
     for note in an.get("notes") or []:
-        lines.append(f"　{note}")
+        lines.append(f"※ {note}")
     for err in an.get("errors") or []:
-        lines.append(f"✘ {err}")
+        lines.append(f"※ ⚠ {err}")
 
     lines.append(
         "※ 加成一律按卡片实际等级折算（容量数字反推，再用面板数值校验）；"
         "复合元素按 火>冰>电>毒 两两配对"
     )
-    return lines
+    return limit_notes(lines)

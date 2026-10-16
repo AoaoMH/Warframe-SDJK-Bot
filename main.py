@@ -33,7 +33,12 @@ from astrbot.api.star import Context, Star, register
 try:  # 允许脱离 AstrBot 直接跑单元测试
     from .core import __brand__ as BRAND
     from .core import api_client
-    from .core.api_client import WarframeAPIError, WarframeClient, parse_url_list
+    from .core.api_client import (
+        DEFAULT_DE_WORLDSTATE,
+        WarframeAPIError,
+        WarframeClient,
+        parse_url_list,
+    )
     from .core import formatters as fmt
     from .core import paths as core_paths
     from .core import wiki_intro
@@ -62,9 +67,13 @@ except ImportError as _imp_err:  # pragma: no cover
         raise
     from core import __brand__ as BRAND
 
-    # 打包器门面锚点：OSS_FACADE_DELETIONS 按此行整块删除，勿删/勿改前缀
     from core import api_client
-    from core.api_client import WarframeAPIError, WarframeClient, parse_url_list
+    from core.api_client import (
+        DEFAULT_DE_WORLDSTATE,
+        WarframeAPIError,
+        WarframeClient,
+        parse_url_list,
+    )
     from core import formatters as fmt
     from core import paths as core_paths
     from core import wiki_intro
@@ -83,17 +92,6 @@ except ImportError as _imp_err:  # pragma: no cover
     from core.commands import DunCommands
     from core.commands.base import _num
     from core.store import GroupStore, SubscriptionStore
-
-
-def _llm_request_hook():
-    """LLM 请求钩子装饰器；测试桩/旧版 AstrBot 没有该钩子时退化为空装饰器。"""
-    deco = getattr(filter, "on_llm_request", None)
-    if deco is None:
-        return lambda fn: fn
-    try:
-        return deco()
-    except Exception:  # noqa: BLE001
-        return lambda fn: fn
 
 
 def _result_hook():
@@ -347,89 +345,74 @@ def _migrate_legacy_user_data(data_dir: Path) -> None:
 
 
 HELP_TOPIC: dict[str, list[tuple[str, str]]] = {
-    "用法速查": [
-        ("帮助 / help", "本页指令总览"),
-        ("状态", "运行状态、版本与订阅数（需群管理员）"),
-        ("平台 -pc / -ps / -xb / -sw", "四平台数据已互通，统一显示「国际服」"),
-        ("输出 -1 / -w ｜ -t ｜ -r", "纯文字 ｜ 强制图片 ｜ 生成密语"),
-        ("翻页 -2 / -3", "看第 2/3 页（列表类指令通用）"),
-        ("群管理", "点号开头（需群管理员）：.默认平台 / .开启 / .关闭 推送 / .状态"),
+    "最常用": [
+        ("时效 / 周报", "各周期剩余时间总览"),
+        ("裂隙 / 开核桃", "虚空裂隙（可筛 钢铁/类型/纪元）｜刷遗物建议"),
+        ("赏金 / 声望", "各地区赏金与奖励（地球 = 地球赏金）"),
+        ("wm 物品名", "市场在售/收购（加 蓝图/机体 查部件）"),
+        ("伤害 武器 对 敌人 100级", "面板 / 单发 / DPS / 分段"),
+        ("紫卡分析 武器名 词条数值", "词条区间与距中（负词条加「负」）"),
     ],
     "周期与日常": [
-        ("夜灵 / 平原时间", "夜灵·金星·魔胎·地球·双衍·扎里曼 周期轮换"),
-        (
-            "赏金 / 声望",
-            "各地区赏金轮次与奖励（「声望」= 赏金；裸发地区词亦可，地球 = 地球赏金 = 地球声望）",
-        ),
-        ("裂隙", "虚空裂隙；可筛 钢铁 / 任务类型 / 等级"),
-        ("突击 / 执刑官", "每日突击三阶段｜本周执刑官猎杀"),
-        ("时效 / 周报", "各周期内容剩余时间总览"),
+        ("夜灵 / 平原时间", "各开放世界昼夜 / 派系周期"),
+        ("突击 / 执刑官", "每日突击｜本周执刑官猎杀"),
+        ("仲裁 / 仲裁表", "当前场次｜整周排期（可筛类型）"),
+        ("警报 / 入侵 / 活动 / 武形秘仪", "进行中的限时内容｜PVP 挑战"),
+        ("电波 / 日历", "午夜电波挑战｜1999 日历"),
     ],
-    "任务与轮换": [
-        ("深层科研 / 时光科研", "本周科研：3 任务 × 普通 / 硬化"),
-        ("沉沦之地 / 炼狱塔", "本周 21 层任务与复杂化"),
-        ("侵袭", "钢铁之路今日侵袭节点"),
-        ("仲裁 / 仲裁表", "当前与未来场次｜整周排期（可筛类型）"),
-        ("警报 / 入侵", "进行中的警报与入侵进度"),
-        ("九重天 / 虚空风暴", "航道星舰任务与奖励"),
-        ("活动 / 武形秘仪", "限时活动｜PVP 挑战"),
+    "周常轮换": [
+        ("深层科研 / 时光科研", "本周 3 任务 × 普通 / 硬化"),
+        ("沉沦之地 / 炼狱塔", "本周 21 层与复杂化"),
+        ("侵袭 / 九重天", "钢路侵袭节点｜虚空风暴"),
+        ("灵化轮换 / 信条 / 终幕", "每周轮换武器与元素加成"),
+        ("舰队进度 / 氏族奖励", "舰队建造｜氏族研究"),
     ],
-    "商店与周常": [
-        ("奸商 / 虚空商人", "Baro Ki'Teer 库存与抵达时间"),
-        ("每日特惠 / 商城折扣", "每日折扣商品｜限时礼包"),
-        ("言录使", "本周周常商品（苦栓结算）"),
-        ("碎银兑换 / 碎银", "Palladino 裂罅碎块商店（钢铁守望）"),
-        ("氏族奖励", "氏族研究进度"),
-        ("出库 / 阿耶", "Prime 出库清单｜御品阿耶兑换"),
-        ("灵化轮换", "钢铁回廊每周灵化适配器"),
-        ("终幕 / 信条", "每周轮换武器与元素加成"),
-        ("舰队进度", "巴罗尔巨人战舰 / 利刃豺狼舰队"),
+    "商店": [
+        ("奸商 / 虚空商人", "Baro 库存与抵达时间"),
+        ("每日特惠 / 商城折扣", "每日折扣｜限时礼包"),
+        ("言录使 / 碎银 / 钢铁之路", "苦栓周常｜碎银兑换｜Teshin 商店"),
+        ("出库 / 阿耶", "Prime 出库清单｜阿耶兑换"),
     ],
-    "资料与进度": [
-        ("新闻 / 最近更新", "官方公告与热修"),
-        ("电波 / 午夜电波", "本周挑战与等级"),
-        ("日历", "1999 日历：当前季与日程"),
-        ("结合目标", "Simaris 结合仪式目标与出处"),
-        ("wiki 关键词", "词库直达维基页面"),
-        ("翻译", "中英名称对照（纯文本，如 翻译 腐蚀投射）"),
-        ("赤毒 / 钢铁之路", "赤毒历史｜Teshin 荣誉商店"),
+    "市场与紫卡": [
+        ("趋势 物品名", "48h / 90d 价格走势"),
+        ("wr / 紫卡 / rm 武器名", "紫卡拍卖｜源紫卡报价"),
+        ("倾向 / 紫卡排行", "倾向值｜热度榜（加 刷新 强更）"),
     ],
     "遗物与资源": [
-        ("遗物 / 核桃", "奖励与出处；出库 / 入库 / 列表"),
-        ("开核桃 / 裂缝", "遗物收益筛选：速刷|全部 低价|高价"),
+        ("遗物 / 核桃 名称", "奖励与出处；出库 / 入库 / 列表"),
         ("部件 物品名", "Prime 部件与蓝图出处"),
-        ("金垃圾 / 银垃圾 / 铜垃圾", "按杜卡德价值分档清单"),
+        ("金垃圾 / 银垃圾 / 铜垃圾", "按杜卡德分档"),
     ],
     "伤害与配卡": [
-        (
-            "伤害 武器 对 敌人 100级 膛线",
-            "面板/单发/DPS/含段合计；可加 爆头 病毒10 剥甲 满镀层 钢路",
-        ),
-        ("灵化 / 基础形态", "有灵化形态的武器默认按灵化算（MOD 照常叠算）"),
-        ("空战 / 地面", "空战枪双部署切换"),
-        ("进化 基伤/暴击/爆头…", "灵化进化选项，可多次，改基础面板"),
-        ("赤毒辐射60", "玄骸/姐妹武器回响加成（25~60%）"),
-        ("识卡 ＋ 配卡截图", "读升级界面：武器/卡片/等级/面板校验"),
-        ("识卡伤害 对 重机枪手 150级", "复用最近识卡结果换敌人/等级复算"),
-        ("武器融合 电60 火58", "玄骸/姐妹武器效价融合"),
-        ("玄骸 / xh", "玄骸与姐妹武器查询"),
+        ("识卡 + 截图", "读配卡界面并校验面板"),
+        ("识卡伤害 对 敌人 等级", "复用识卡结果复算"),
+        ("武器融合 / 玄骸 / xh", "效价融合｜玄骸拍卖"),
     ],
-    "紫卡与市场": [
-        ("紫卡分析 武器名 词条数值", "词条区间与距中；负词条加「负」"),
-        ("倾向 武器名", "紫卡倾向值"),
-        ("wr / 紫卡 武器名", "紫卡拍卖：词条·洗数·极性筛选"),
-        ("rm 武器名", "源紫卡报价"),
-        ("紫卡排行 / 排行", "热度榜；「紫卡排行 刷新」强更"),
-        (
-            "wm 物品名",
-            "在售/收购；部件查单加 蓝图/机体/系统/头部；可加 满级 / 光辉 / 墨染 / N个 / -r 密语",
-        ),
-        ("趋势 物品名", "48h / 90d 价格走势"),
+    "资料与推送": [
+        ("新闻 / 结合目标 / 赤毒", "官方公告｜Simaris 目标｜赤毒历史"),
+        ("wiki 词 / 翻译 词", "维基直达｜中英对照"),
+        ("蹲 类型 筛选 时长 时间", "订阅变化推送（需先 .开启 推送）"),
+        ("蹲 取消 / 蹲 帮助", "取消订阅｜可蹲类型与写法"),
     ],
-    "后台推送": [
-        ("蹲 类型 筛选 时长 时间", "订阅世界状态变化并推送（需先 .开启 推送）"),
-        ("蹲 取消", "不带词=全部；带筛选词=只取消匹配项"),
-        ("蹲 筛选写法", "一个词=一个条件（钢铁防御）；多词=多条件取或"),
+}
+
+# 帮助卡的注脚（挂在某个分组之后；"" = 卡首）。2026-10-11 卡片改版：伤害修饰词 / 群管理 /
+# 平台说明从指令行挪到注脚 —— 指令行只留「可照发」的主指令；注脚里的写法仍由
+# tests/test_help_coverage.py 校验（主指令覆盖、修饰符可解析、管理员标注）。
+HELP_NOTES: dict[str, list[str]] = {
+    "": [
+        "指令直接发即可，无需 / 前缀（/help 属系统内置指令）；列表类加 -2 / -3 翻页；"
+        "-w / -1 纯文字 · -t 强制图片 · -r 生成密语",
+    ],
+    "伤害与配卡": [
+        "伤害可加：爆头 病毒10 剥甲 满镀层 钢路 开火N秒｜灵化 / 基础形态 / 副开火 / 蓄力 / "
+        "未蓄力 / 半自动 / 空战 / 地面 / 进化 X / 赤毒辐射60（玄骸回响 25~60%）",
+    ],
+    "资料与推送": [
+        "帮助 / help = 本页；状态 = 运行状态、版本与订阅数（需群管理员）；"
+        "群管理（点号开头，需群管理员）：.默认平台 / .开启 / .关闭 推送 / .状态；"
+        "平台后缀 -pc / -ps / -xb / -sw：四平台数据已互通，统一显示「国际服」；"
+        "「赤毒」虹吸数据源已停摆，发它会给出替代查询；「蹲 取消」不带词 = 自己发起的全部（群管 = 全群）",
     ],
 }
 
@@ -450,7 +433,7 @@ HELP_TOPIC: dict[str, list[tuple[str, str]]] = {
 
 
 @register(
-    "astrbot_plugin_warframe_sdjkbot", "SDJK", f"{BRAND}：世界状态 / 市场查价 / 蹲点推送", "1.1.5"
+    "astrbot_plugin_warframe_sdjkbot", "SDJK", f"{BRAND}：世界状态 / 市场查价 / 蹲点推送", "1.2.0"
 )
 class WarframeSDJK(
     DailyCommands,
@@ -480,6 +463,7 @@ class WarframeSDJK(
         self.client = WarframeClient(
             kuvalog_url=(self.cfg.get("kuvalog_url") or ""),
             worldsource=self.cfg.get("worldsource", "de"),
+            de_worldstate_url=(self.cfg.get("de_worldstate_url") or DEFAULT_DE_WORLDSTATE),
             worldstate_base=self.cfg.get("worldstate_base", "https://api.warframestat.us"),
             timeout=_num(self.cfg, "http_timeout", 15.0),
             proxy=(self.cfg.get("proxy") or None),
@@ -517,6 +501,8 @@ class WarframeSDJK(
             self._push_send,
             logger,
             interval=int(_num(self.cfg, "push_interval", 45)),
+            groups=self.groups,  # 派发前查群推送开关（.关闭 推送 = 订阅暂停）
+            state_path=data_dir / "push_baseline.json",  # 基线落盘：30 分钟内重启补推
         )
         self._routes = self._build_routes()
 
@@ -580,9 +566,6 @@ class WarframeSDJK(
             "status": self._h_status_cmd,
         }
 
-
-    # ------------------------------------------------------------------
-
     # ------------------------------------------------------------------
     # 出站兜底：剥掉 QQ 渲染不了的 Markdown（2026-09-15 用户要求）
     # ------------------------------------------------------------------
@@ -639,6 +622,9 @@ class WarframeSDJK(
 
     async def initialize(self):
         self.push.start()
+        # 守护协程意外退出必须留痕（stop/重载的主动取消不报）
+        if self.push.task is not None:
+            self.push.task.add_done_callback(self._log_task_death("push_daemon"))
         self._auto_task = asyncio.create_task(self._rank_autoloop())
         self._auto_task.add_done_callback(self._log_task_death("_rank_autoloop"))
         self._valence_task = asyncio.create_task(self._valence_autoloop())
@@ -708,6 +694,29 @@ class WarframeSDJK(
             )
         except Exception as exc:  # noqa: BLE001 —— 预热失败不影响功能
             logger.warning("[sdjk] 预热失败（不影响功能）：%s", exc)
+        # 其余「首次查询才现解析」的大表（都有模块级缓存）：不预热时第一条
+        # wiki/搜索/活动卡要在事件循环上同步解析数 MB JSON（实测约 1 s 级）
+        _t1 = _t.perf_counter()
+        try:
+            from .core import de_worldstate as _ws
+            from .core import search as _search
+            from .core import wiki_intro as _wi
+        except ImportError:
+            from core import de_worldstate as _ws
+            from core import search as _search
+            from core import wiki_intro as _wi
+        for _name, _fn in (
+            ("wiki 简介表", _wi._table),
+            ("检索索引", _search._index),
+            ("官方简中词表", lambda: _ws._load("languages_zh.json")),
+        ):
+            try:
+                _fn()
+            except Exception as exc:  # noqa: BLE001 —— 预热失败不影响功能
+                logger.warning("[sdjk] 预热 %s 失败（不影响功能）：%s", _name, exc)
+        logger.info(
+            "[sdjk] 预热完成 %.0f ms（wiki/检索/简中词表）", (_t.perf_counter() - _t1) * 1000
+        )
 
     # 价格榜单全量抓取只在**闲时**跑。2026-09-14 用户反馈「bot 回话间隔很久」：
     # 全量抓取实测远超 18 分钟（约 3200 项、实测 1 项/4 秒，跑好几个小时），
@@ -1025,7 +1034,9 @@ class WarframeSDJK(
         try:
             reply = await handler(parsed, event, platform)
         except WarframeAPIError as exc:
-            reply = Reply(raw_text=f"⚠️ {exc}")
+            # 原文（可能含上游 URL / httpx 异常 / FlareSolverr 内网地址）只进日志
+            logger.warning("[sdjk] 指令 %s 接口错误：%s", parsed.command, exc)
+            reply = Reply(raw_text=f"⚠️ {api_client.public_error_text(exc)}")
         except Exception as exc:  # noqa: BLE001
             logger.exception("[sdjk] 指令处理异常：%s", exc)
             reply = Reply(raw_text="⚠️ 内部错误，请稍后重试或联系管理员查看日志")
@@ -1205,10 +1216,22 @@ class WarframeSDJK(
             value = cmd == "开启"
             await self.groups.set_switch(umo, args[0], value)
             state = "已开启" if value else "已关闭"
-            return Reply(
-                raw_text=f"✅ {args[0]}功能{state}"
-                + ("，可以用「蹲 类型」订阅推送了" if value and args[0] == "推送" else "")
-            )
+            tail = ""
+            if args[0] == "推送":
+                n_subs = len(self.subs.for_umo(umo))
+                if value:
+                    tail = (
+                        f"，已有 {n_subs} 条订阅恢复推送"
+                        if n_subs
+                        else "，可以用「蹲 类型」订阅推送了"
+                    )
+                else:
+                    tail = (
+                        f"，已有 {n_subs} 条订阅暂停（订阅保留，重新 .开启 推送 后恢复）"
+                        if n_subs
+                        else ""
+                    )
+            return Reply(raw_text=f"✅ {args[0]}功能{state}{tail}")
 
         if cmd == "状态":
             # ★ 安全审查（2026-09-18）：这条会列出**本群全部订阅明细**
@@ -1260,7 +1283,7 @@ class WarframeSDJK(
                 raw_text="「.锚点」已废弃：仲裁表现在按 arbi.wf.wiki 的"
                 "确定性排期自动推算，不需要手动校准。\n"
                 "· 看当前与下一小时场次：发「仲裁」\n"
-                "· 看整周 30 天排期：发「仲裁表」（可筛类型）"
+                "· 看未来 14 天排期：发「仲裁表」（可筛类型，如「仲裁表 生存」）"
             )
         if cmd in ("帮助", "help"):
             return await self._h_help(None, event, self.groups.platform(umo))
@@ -1283,11 +1306,12 @@ class WarframeSDJK(
         剥掉，见文件头「指令空间避让」），而 "/help" 属于 AstrBot 内置指令，
         已被本插件主动让路 —— 说明一句，免得用户以为帮助坏了。
         """
-        lines = ["※ 指令直接发即可，无需 / 前缀（/help 属系统内置指令）"]
+        lines = [f"※ {n}" for n in HELP_NOTES.get("", [])]
         for t, items in HELP_TOPIC.items():
             lines.append(f"◆ {t}")
             # 全角空格分隔：渲染层按此切成两列并做首字符垂直线对齐
             lines += [f"· {c}　{d}" for c, d in items]
+            lines += [f"※ {n}" for n in HELP_NOTES.get(t, [])]
         return Reply(f"{BRAND} 指令一览", lines, footer=fmt.fmt_platform_footer(platform))
 
     # ------------------------------------------------------------------

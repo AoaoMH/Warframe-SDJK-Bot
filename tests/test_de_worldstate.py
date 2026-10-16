@@ -64,7 +64,11 @@ assert all(f["node"] for f in fiss)
 # 突击 / 执刑官
 assert b["sortie"]["boss"] and len(b["sortie"]["variants"]) == 3
 assert all(v["modifier"] for v in b["sortie"]["variants"])
-assert "Amar" in b["archonHunt"]["boss"]
+# ★ 2026-10-11 改断言：首领名改走官方词表（/Lotus/Language/Narmer/ArchonAmar = 执刑官欺谋狼主），
+#   不再是「执刑官 Archon Amar」拼接；英文代码移到 bossCode。
+assert b["archonHunt"]["bossCode"] == "Amar", b["archonHunt"]
+assert b["archonHunt"]["boss"] == "执刑官欺谋狼主", b["archonHunt"]["boss"]
+assert [v["level"] for v in b["archonHunt"]["variants"]] == ["130-135级", "135-140级", "145-150级"]
 
 # 奸商（样例抓取时未抵达）
 assert b["voidTrader"]["active"] is False
@@ -160,7 +164,19 @@ print("九重天 0s 修复：断言通过")
 # 的本地表 ⇒ 沉沦之地复杂化名 / 1999 升级名 / 源力石 / 赋能槽连接器全落英文。
 # 修法：构建期提取卡面命名空间 → core/data/de/zh_ext.json（运行期由 language_text_zh 第二顺位查）。
 _ext = dw._load("zh_ext.json") or {}
-assert len(_ext) >= 7000, f"zh_ext 键数异常：{len(_ext)}"
+# 2026-10-10 去冗余：与 languages_zh 同键同值的条目运行期永远读不到（先查 languages_zh），
+# 构建时已剔除（7,722 → 2,076；CircleOfHell 整段保留，_coh_index 只读 zh_ext）。
+# ⇒ 覆盖面改按「两表并集」计（实测 38,135），并守住「非 CoH 段不再有同值冗余」。
+_base_zh = dw._load("languages_zh.json") or {}
+assert len(set(_base_zh) | set(_ext)) >= 38000, (
+    f"两表并集键数异常：{len(set(_base_zh) | set(_ext))}"
+)
+_shadowed = [
+    k
+    for k, v in _ext.items()
+    if _base_zh.get(k) == v and not k.startswith("/Lotus/Language/CircleOfHell/")
+]
+assert not _shadowed, f"zh_ext 出现与 languages_zh 同值的冗余键 {len(_shadowed)} 条"
 _coh = [k for k in _ext if "cohchallenge" in k.lower()]
 assert len(_coh) >= 68, f"zh_ext 覆盖 CoHChallenge* 应 ≥68，实得 {len(_coh)}"
 # 抽 6 条与官方值逐字对齐（键/值均经双方独立复算）
@@ -604,8 +620,14 @@ print("§二 端到端：本周 21 层 × 类型+目标 = 42 项逐层等于期�
 
 # 全部 DESCENT_TYPES（订正后 24 条）：产出**不得是裸 `DT_` 代码**
 assert len(dw.DESCENT_TYPES) == 24, len(dw.DESCENT_TYPES)
+# ★ 2026-10-11 改断言：DT_UNIQUE（官方无键、wiki 未收录）不再编造「Assassination」，
+#   类型列写内部代码 —— 与卡面注脚「官方无简中、保留内部代码：DT_UNIQUE」一致；
+#   其余 23 条仍不得是裸代码。
 for _c, _eng in dw.DESCENT_TYPES.items():
-    _txt, _ = fmt.descent_type_label(_c, _eng)
+    _txt, _ok = fmt.descent_type_label(_c, _eng)
+    if _c in dw.DESCENT_TYPE_NO_KEY:
+        assert _txt == _c and _ok is False, f"{_c} 应原样保留内部代码：{_txt!r}"
+        continue
     assert _txt and not _txt.startswith("DT_"), f"{_c} 产出裸代码或空：{_txt!r}"
 # `DESCENT_TYPE_NO_KEY` 命中数 4 → ≤1（只允许 DT_UNIQUE）
 assert dw.DESCENT_TYPE_NO_KEY == frozenset({"DT_UNIQUE"}), dw.DESCENT_TYPE_NO_KEY
@@ -1186,6 +1208,9 @@ assert (_m.get("reward") or {}).get("credits") == 10000 and (_m.get("reward") or
     str(_m.get("reward"))
 )
 _t3, _l3 = fmt.fmt_alerts(_al)
+# ★ 2026-10-11 第二步改版：警报行改为「· 节点　类型　等级　奖励　剩…」表格行（卡首另有摘要行），
+#   断言对象由 _l3[0] 改为首条「· 」数据行；语义不变（奖励不再「?」、四项信息都在）。
+_l3 = [ln for ln in _l3 if ln.startswith("· ")]
 assert (
     _l3
     and "?" not in _l3[0]
@@ -1197,6 +1222,7 @@ assert (
 _l4 = fmt.fmt_alerts(
     [{**_al[0], "mission": {**_m, "reward": {**_m["reward"], "item_names": ["2021 年 QTCC 玩偶"]}}}]
 )[1]
+_l4 = [ln for ln in _l4 if ln.startswith("· ")]
 assert _l4 and "2021 年 QTCC 玩偶" in _l4[0], str(_l4)
 print("§三 C3 警报解析：MissionInfo 补全 / 奖励不再「?」/ 中文名优先 —— 断言通过")
 
@@ -1268,3 +1294,438 @@ async def _resolve_probe():
 
 rw_ok = asyncio.run(_resolve_probe())
 print("§四 警报奖励中文名：反查表（三条玩偶）/ 路径归一 / 三级回落不造名 —— 断言通过")
+
+
+# ⑤ 2026-10-16 线上实例（ZCode 诊断）：《奔赴 Tau 星系》活动警报 countedItems ×50。
+#    修前：卡面「RoadToTauEventResource（未收录）」且数量丢失。
+#    官方名在 WFCD i18n 补充表（de/name_zh_wfcd.json，DE 官方导出尚无此条）。
+_TAU = "/Lotus/Types/Gameplay/Events/RoadToTauEvent/RoadToTauEventResource"
+assert dw.official_item_zh(_TAU) == "月华脯", dw.official_item_zh(_TAU)
+assert dw.official_item_zh("/Lotus/Types/Nope/Unknown") is None  # 查不到不造名、不回落英文
+_raw_tau = {
+    "Alerts": [
+        {
+            "_id": {"$oid": "tau1"},
+            "Expiry": {"$date": {"$numberLong": "4102444800000"}},
+            "MissionInfo": {
+                "location": "SolNode1",
+                "missionType": "MT_EXTERMINATION",
+                "faction": "FC_INFESTATION",
+                "minEnemyLevel": 50,
+                "maxEnemyLevel": 50,
+                "descText": "/Lotus/Language/TauPrologue/EventAlertTitle",
+                "missionReward": {
+                    "credits": 17000,
+                    "items": None,
+                    "countedItems": [
+                        {"ItemType": _TAU, "ItemCount": 50},
+                        {"ItemType": "/Lotus/Types/Nope/UnknownThing", "ItemCount": 3},
+                    ],
+                },
+            },
+        }
+    ]
+}
+_al_tau = dw._parse_alerts(_raw_tau)
+assert _al_tau[0]["mission"]["reward"]["counts"] == [50, 3], _al_tau[0]["mission"]["reward"]
+
+
+async def _tau_probe():
+    c = WarframeClient()
+
+    async def _wm():
+        return []
+
+    c.wm_items = _wm  # type: ignore[method-assign]
+    return await c._resolve_alert_items(_al_tau)
+
+
+_al_tau = asyncio.run(_tau_probe())
+_rw_tau = _al_tau[0]["mission"]["reward"]
+assert _rw_tau["item_names"] == ["月华脯 ×50"], _rw_tau
+_t_tau, _l_tau = fmt.fmt_alerts(_al_tau)
+assert any("月华脯 ×50" in ln and "17000现金" in ln for ln in _l_tau), _l_tau
+assert not any("RoadToTauEventResource" in ln for ln in _l_tau), _l_tau
+# 全部未收录时：末段 + （未收录）+ 数量（不造名字）
+_rw_u = asyncio.run(
+    WarframeClient()._resolve_alert_items(
+        [{"mission": {"reward": {"items": ["/Lotus/Types/Nope/X"], "counts": [7]}}}]
+    )
+)[0]["mission"]["reward"]
+assert _rw_u["item"] == "X（未收录） ×7" and _rw_u["item_names"] == [], _rw_u
+print("§四⑤ 警报 countedItems 数量保留 + WFCD i18n 补充表命中「月华脯 ×50」—— 断言通过")
+
+
+# ---------------------------------------------------------------------------
+# §B11（2026-10-11）世界状态解析审计修复：逐项回归（内嵌桩，不联网）
+# ---------------------------------------------------------------------------
+def _ld(ms: int) -> dict:
+    return {"$date": {"$numberLong": str(ms)}}
+
+
+_NOW = 1791680400000  # 2026-10-11T01:00:00Z（毫秒）
+
+# ⑨ _ms 兼容 {"$date": ISO 串} / {"$date": 数字} / 嵌套 $numberLong / 秒级
+assert dw._ms({"$date": "2026-10-11T01:00:00Z"}) == _NOW
+assert dw._ms({"$date": "2026-10-11T01:00:00.000+00:00"}) == _NOW
+assert dw._ms({"$date": _NOW}) == _NOW
+assert dw._ms(_ld(_NOW)) == _NOW and dw._ms(_NOW // 1000) == _NOW
+assert dw._ms({"$date": "not-a-date"}) is None and dw._ms({"$date": None}) is None
+
+# ⑨ 单段失败不拖垮整包：坏掉的 section 置空，其余照常
+_bad = dict(raw)
+_bad["VoidTraders"] = "x"
+_bad["Invasions"] = [None]
+_bad["SeasonInfo"] = ["x"]
+_bb = dw.parse_worldstate(_bad, now_ms=1788964350000)
+assert not _bb["voidTrader"].get("active") and not _bb["voidTrader"].get("inventory")
+assert _bb["invasions"] == [] and _bb["nightwave"] == {}, (_bb["invasions"], _bb["nightwave"])
+assert _bb["fissures"] and _bb["sortie"], "其余 section 必须照常解析"
+_bad2 = dict(raw)
+_bad2["Sorties"] = [{"Activation": {"$date": "2026-10-11T00:00:00Z"}, "Boss": "SORTIE_BOSS_HEK"}]
+assert dw.parse_worldstate(_bad2, now_ms=_NOW)["sortie"]["activation"].startswith("2026-10-11")
+
+# ⑦ 希图斯：DE 包过期未轮换时按 150 分钟周期前滚（不再伪造「剩 3600s」）
+_c = dw.cetus_cycle(_NOW - 600_000, _NOW)  # 过期 10 分钟 ⇒ 新周期剩 140 分钟 ⇒ 白天剩 90 分钟
+assert _c["state"] == "day" and _c["expiry"] == dw._iso(_NOW + 90 * 60_000), _c
+_c2 = dw.cetus_cycle(_NOW - 9000_000 - 6000_000, _NOW)  # 过期 1 周期 + 100 分钟 ⇒ 夜晚剩 50 分钟
+assert _c2["state"] == "night" and _c2["expiry"] == dw._iso(_NOW + 50 * 60_000), _c2
+# ⑦ 扎里曼：没有 Seed ⇒「未知」，不再默认 grineer
+_zu = dw.zariman_cycle(None, _NOW + 60_000, _NOW)
+assert _zu["state"] == "unknown" and _zu["stateCn"] == "未知", _zu
+assert dw.zariman_cycle(3, _NOW + 60_000, _NOW)["state"] == "corpus"
+
+# ⑤ 九重天风暴：VoidStorms 无 MissionType ⇒ 回落节点表类型
+_fs = dw._parse_fissures(
+    {
+        "VoidStorms": [
+            {
+                "Node": "CrewBattleNode519",
+                "ActiveMissionTier": "VoidT1",
+                "Activation": _ld(_NOW),
+                "Expiry": _ld(_NOW + 3600_000),
+            }
+        ]
+    }
+)
+assert (
+    _fs
+    and _fs[0]["isStorm"]
+    and _fs[0]["missionType"] == dw.sol_node("CrewBattleNode519").get("type")
+), _fs
+assert _fs[0]["missionType"], "风暴任务类型不得为空"
+
+# ③ 执刑官：官方词表名 + bossCode + wiki 固定档位等级
+_ar = dw._parse_sortie(
+    {
+        "Boss": "SORTIE_BOSS_NIRA",
+        "Missions": [
+            {"missionType": "MT_EXTERMINATION", "node": "SolNode126"},
+            {"missionType": "MT_SURVIVAL", "node": "SolNode74"},
+            {"missionType": "MT_ASSASSINATION", "node": "SolNode53"},
+        ],
+    },
+    archon=True,
+)
+assert _ar["boss"] == "执刑官混沌蛇主" and _ar["bossCode"] == "Nira", _ar
+assert "Archon" not in _ar["boss"] and not _ar["boss"].startswith("执刑官 ")
+assert [v["level"] for v in _ar["variants"]] == list(dw.ARCHON_STAGE_LEVELS)
+assert dw.archon_name("SORTIE_BOSS_BOREAL") == "执刑官诡文枭主"
+assert dw.archon_name("SORTIE_BOSS_AMAR") == "执刑官欺谋狼主"
+# 突击不受影响：仍是节点等级
+_so = dw._parse_sortie(
+    {"Boss": "SORTIE_BOSS_HEK", "Variants": [{"node": "SolNode126", "missionType": "MT_DEFENSE"}]},
+    archon=False,
+)
+assert _so["bossCode"] == "" and _so["variants"][0]["level"] == dw.node_level("SolNode126")
+
+# ⑥ 午夜电波：/WeeklyHard/ 路径判精英
+_nw = dw._parse_nightwave(
+    {
+        "ActiveChallenges": [
+            {
+                "Challenge": "/Lotus/Types/Challenges/Seasons/WeeklyHard/SeasonWeeklyHardEliteSanctuaryOnslaught"
+            },
+            {"Challenge": "/Lotus/Types/Challenges/Seasons/Weekly/SeasonWeeklyCompleteRace"},
+        ]
+    }
+)
+assert [c["isElite"] for c in _nw["activeChallenges"]] == [True, False], _nw
+
+# ⑩ 入侵：Infested 口径 = (1 + Count/Goal) × 100（WFCD Invasion.ts）；Grineer/Corpus 不变
+_iv = dw._parse_invasions(
+    {
+        "Invasions": [
+            {
+                "Faction": "FC_INFESTATION",
+                "DefenderFaction": "FC_CORPUS",
+                "DefenderMissionInfo": {"faction": "FC_INFESTATION"},
+                "Count": -23632,
+                "Goal": 30000,
+                "Node": "SettlementNode20",
+            },
+            {
+                "Faction": "FC_CORPUS",
+                "DefenderFaction": "FC_GRINEER",
+                "DefenderMissionInfo": {"faction": "FC_CORPUS"},
+                "Count": -18866,
+                "Goal": 47000,
+                "Node": "SolNode146",
+            },
+        ]
+    }
+)
+_inf = next(i for i in _iv if i["vsInfestation"])
+_gc = next(i for i in _iv if not i["vsInfestation"])
+assert abs(_inf["attacker_pct"] - (1 - 23632 / 30000) * 100) < 1e-6, _inf["attacker_pct"]
+assert abs(_gc["attacker_pct"] - (47000 - 18866) / (2 * 47000) * 100) < 1e-6
+
+# ⑧ Prime 重生：词表缺名的组合包不丢弃，美化名 +「（未收录）」并计数
+_pv = dw._parse_prime_vault(
+    {
+        "PrimeVaultTraders": [
+            {
+                "Expiry": _ld(_NOW + 86400_000),
+                "Manifest": [
+                    {
+                        "ItemType": "/Lotus/Types/StoreItems/Packages/MegaPrimeVault/"
+                        "MPVZzzTestPrimeSinglePack",
+                        "PrimePrice": 3,
+                    }
+                ],
+                "EvergreenManifest": [],
+            }
+        ]
+    },
+    _NOW,
+)
+assert len(_pv["items"]) == 1 and _pv["items"][0]["name"].endswith("（未收录）"), _pv["items"]
+assert _pv["unnamed"] == [_pv["items"][0]["name"]]
+
+# ⑪ 商城礼包 / 活动：按到期时间戳排序（不是 timeLeft 字符串）
+_fl = dw._parse_flash_sales(
+    {
+        "FlashSales": [
+            {"TypeName": "/A", "ShowInMarket": True, "EndDate": _ld(_NOW + 9 * 60_000)},
+            {"TypeName": "/B", "ShowInMarket": True, "EndDate": _ld(_NOW + 1000 * 3600_000)},
+            {"TypeName": "/C", "ShowInMarket": True, "EndDate": _ld(_NOW + 23 * 3600_000)},
+        ]
+    },
+    _NOW,
+)
+assert [x["_endMs"] for x in _fl] == sorted(x["_endMs"] for x in _fl), [x["timeLeft"] for x in _fl]
+_gl = dw._parse_goals(
+    {
+        "Goals": [
+            {"Tag": "A", "Expiry": _ld(_NOW + 254 * 3600_000)},
+            {"Tag": "B", "Expiry": _ld(_NOW + 54 * 60_000)},
+        ]
+    },
+    _NOW,
+)
+assert [g["tag"] for g in _gl] == ["B", "A"], [g["tag"] for g in _gl]
+
+# ⑫ 翻译 / 文案
+assert dw.DESCENT_TYPES["DT_UNIQUE"] == "", "DT_UNIQUE 不得编造 Assassination"
+assert dw._conquest_text("DullBlades", "CT_LAB")[0] == "钝重兵刃"
+assert dw._node_name("EventNode35") == "地球", dw._node_name("EventNode35")
+assert (
+    dw._cal_desc_clean("有 10% 的几率触发 250 伤害、 5 米范围的 辐射爆炸。")
+    == "有 10% 的几率触发 250 伤害、5 米范围的辐射爆炸。"
+)
+print(
+    "§B11 世界状态解析修复（_ms/分段兜底/希图斯前滚/扎里曼未知/风暴类型/执刑官/精英/入侵/出库/排序/译名）—— 断言通过"
+)
+
+# ---------------------------------------------------------------------------
+# §B11 卡面（formatters）回归
+# ---------------------------------------------------------------------------
+from datetime import datetime as _dt  # noqa: E402
+from datetime import timedelta as _td  # noqa: E402
+from datetime import timezone as _tz  # noqa: E402
+
+
+def _in(**kw) -> str:
+    return (_dt.now(_tz.utc) + _td(**kw)).isoformat()
+
+
+# ③ 执刑官卡：首领官方名、wiki 档位、源力石按 code 匹配
+_t, _al = fmt.fmt_archon(
+    {
+        "boss": "执刑官混沌蛇主",
+        "bossCode": "Nira",
+        "expiry": _in(days=1),
+        "variants": [
+            {"node": "Metis（木星）", "level": "130-135级", "missionType": "歼灭"},
+            {"node": "Carme（木星）", "level": "135-140级", "missionType": "生存"},
+            {"node": "Themisto（木星）", "level": "145-150级", "missionType": "刺杀"},
+        ],
+    }
+)
+# ★ 2026-10-11 第二步改版：首行改为 KV「◆ 本周执刑官：…」，三阶段做成「· 阶段　节点　类型　等级」表行
+assert _al[0].startswith("◆ 本周执刑官：执刑官混沌蛇主"), _al[0]
+_arows = [ln for ln in _al if ln.startswith("· ")]
+assert len(_arows) == 3 and "Metis（木星）" in _arows[0] and "130-135级" in _arows[0], _al
+assert "145-150级" in _arows[2], _al
+assert any("琥珀执刑官源力石（黄）" in ln for ln in _al), _al
+assert not any("Archon" in ln for ln in _al)
+
+# ⑩/⑫ 入侵卡：Infestation 统一显示 Infested
+_t, _il = fmt.fmt_invasions(
+    [
+        {
+            "node": "Iliad（火卫一）",
+            "attacker": {"faction_code": "FC_INFESTATION", "items": []},
+            "defender": {"faction_code": "FC_CORPUS", "items": ["x"]},
+            "attacker_pct": 21.2,
+            "defender_pct": 78.8,
+            "vsInfestation": True,
+        }
+    ]
+)
+# ★ 改版后：_il[0] 是「◆ 进行中」摘要，节点标题 / 进度行各占一行（进度行是「· 进度　…」）
+assert any("Infested（攻）" in ln for ln in _il) and not any("Infestation" in ln for ln in _il), _il
+assert any("Infested 21% vs 79% Corpus" in ln for ln in _il), _il
+
+# ⑪ 每日特惠：余量 = 总量 − 已售
+_t, _dl = fmt.fmt_daily_deals(
+    [
+        {
+            "item": "野马",
+            "salePrice": 133,
+            "originalPrice": 190,
+            "total": 200,
+            "sold": 63,
+            "expiry": _in(hours=9),
+        }
+    ]
+)
+assert any("余量137/200" in ln for ln in _dl), _dl
+
+# ⑪/⑫ 九重天 / 活动 / 出库：按 expiry 现算，统一「X天X小时 / X小时X分 / X分钟」
+_t, _sl = fmt.fmt_void_storms(
+    [
+        {
+            "tier": "T1",
+            "nodeCn": "本达尔星团（地球比邻星域）",
+            "missionType": "Skirmish",
+            "expiry": _in(minutes=46, seconds=50),
+            "timeLeft": "46m 43s",
+        }
+    ]
+)
+_srow = [ln for ln in _sl if ln.startswith("· ")]  # 改版后末行是注脚，取最后一条列表行
+assert _srow and _srow[-1].endswith("剩46分钟") and "m " not in _srow[-1], _sl
+_t, _el = fmt.fmt_events(
+    [
+        {
+            "name": "热美亚裂缝",
+            "expiry": _in(hours=254, minutes=58),
+            "timeLeft": "254h 56m",
+            "ended": False,
+        }
+    ]
+)
+assert any(ln.endswith("剩10天14小时") for ln in _el), _el  # 改版：「· 时限　剩…」行
+_t, _vl = fmt.fmt_prime_vault_list(
+    {"expiry": _in(hours=448, minutes=58), "timeLeft": "448h 56m", "items": []}
+)
+assert _vl[0] == "◆ 本期剩余：剩余 18天16小时", _vl[0]  # 改版：KV 答案行替代「⏳ 本期剩余」
+
+# ★ 2026-10-16（用户要求）：「出库」列本期出库遗物 + 每个遗物的全部部件（稀有 → 罕见 → 常见）。
+#   名字取自 2026-10-16 实时 worldstate：新出库遗物简中词表常缺，回落英文「Lith B12 Relic」。
+from core import wiki_intro as _wi  # noqa: E402
+
+assert _wi.relic_rewards("Lith B12 Relic") == _wi.relic_rewards("古纪 B12 遗物") is not None
+assert _wi.relic_rewards("Lith B12 Relic")["稀有"] == ["苍鹰 Prime 枪托"]
+assert _wi.relic_rewards("Lith Z99 Relic") is None and _wi.relic_rewards("Foo B1") is None  # 不猜
+_vr_items = [
+    {"name": "Protea Prime", "kind": "frame"},
+    {"name": "Axi A23 Relic", "kind": "relic", "prime": 1, "prime_currency": False},
+    {"name": "Lith B12 Relic", "kind": "relic", "prime": 1, "prime_currency": False},
+    {"name": "Neo Q99 Relic", "kind": "relic", "prime": 1, "prime_currency": False},
+    {"name": "Ivara Prime 组合包", "kind": "pack"},
+]
+_t, _vr = fmt.fmt_prime_vault_list(
+    {"expiry": _in(days=3), "items": _vr_items},
+    relic_parts={
+        it["name"]: _wi.relic_rewards(it["name"]) for it in _vr_items if it["kind"] == "relic"
+    },
+)
+assert "◆ 出库遗物（3，瓦奇娅处用阿耶精华兑换）" in _vr, _vr
+_i_lith, _i_axi = _vr.index("◆ 古纪 B12　1 阿耶精华"), _vr.index("◆ 后纪 A23　1 阿耶精华")
+assert _i_lith < _i_axi, _vr  # 古纪在前、后纪在后
+assert _vr[_i_lith + 1] == "· 稀有　苍鹰 Prime 枪托", _vr[_i_lith + 1]
+assert _vr[_i_lith + 2].startswith("· 罕见　") and _vr[_i_lith + 3].startswith("· 常见　Forma 蓝图")
+assert "· 部件　遗物表未收录（发「遗物 名称」查询）" in _vr, _vr  # 查不到不造部件
+# ★ 部件按**杜卡德价值**金 / 银 / 铜上色（不按槽位稀有度）：前纪 I3 的罕见槽「Protea Prime 系统蓝图」值 100 ⇒ 金
+#   （10-16 实测 WM 杜卡德榜单）；无价格（Forma）与价格源不可用时都不染色。
+assert fmt.ducat_span(100, "X") == "⟦g⟧X⟦/g⟧" and fmt.ducat_span(65, "X") == "⟦s⟧X⟦/s⟧"
+assert fmt.ducat_span(45, "X") == "⟦s⟧X⟦/s⟧" and fmt.ducat_span(25, "X") == "⟦b⟧X⟦/b⟧"
+assert fmt.ducat_span(0, "Forma 蓝图") == "Forma 蓝图"
+_i3 = [{"name": "Meso I3 Relic", "kind": "relic", "prime": 1, "prime_currency": False}]
+_px = {"Protea Prime 系统蓝图": {"ducats": 100}, "苍鹰Prime蓝图": {"ducats": 65}}
+_t, _vi3 = fmt.fmt_prime_vault_list(
+    {"expiry": _in(days=3), "items": _i3},
+    relic_parts={"Meso I3 Relic": _wi.relic_rewards("Meso I3 Relic")},
+    prices=_px,
+)
+_row = next(ln for ln in _vi3 if ln.startswith("· 罕见"))
+assert "⟦g⟧Protea Prime 系统蓝图⟦/g⟧" in _row and "⟦s⟧苍鹰 Prime 蓝图⟦/s⟧" in _row, _row
+assert all("⟦" not in ln for ln in _vr), _vr  # 未给价格 ⇒ 全部不染色（不拿稀有度冒充价值）
+_t, _rr = fmt.fmt_relic_rewards(
+    "古纪 Lith B12",
+    [{"rarity": "罕见", "name": "Protea Prime 系统蓝图"}],
+    {"Protea Prime 系统蓝图": {"ducats": 100, "plat": 10, "dpp": 10.0}},
+)
+assert any("⟦g⟧Protea Prime 系统蓝图⟦/g⟧" in ln and "100杜" in ln for ln in _rr), _rr
+_note = next(ln for ln in _vr if ln.startswith("※ 另有装饰"))
+assert "Relic" not in _note and "Ivara Prime 组合包" in _note, _note  # 遗物不再被说成装饰品
+_t, _vl2 = fmt.fmt_prime_vault(
+    {
+        "expiry": _in(days=3),
+        "items": [
+            {"name": "MPV Zzz（未收录）", "prime": 3, "prime_currency": True, "kind": "pack"}
+        ],
+        "evergreen": [],
+        "unnamed": ["MPV Zzz（未收录）"],
+    }
+)
+assert any("MPV Zzz（未收录）" in ln for ln in _vl2) and any(
+    "1 件官方简中词表未收录" in ln for ln in _vl2
+), _vl2
+
+# ⑤/⑭ 裂隙卡：风暴类型与九重天卡同译表；0 结果时给明确提示
+_t, _fl2 = fmt.fmt_fissures(
+    [
+        {
+            "tier": "Lith",
+            "missionType": "Skirmish",
+            "node": "本达尔星团",
+            "isStorm": True,
+            "expiry": _in(minutes=30),
+        }
+    ]
+)
+assert any(ln.startswith("· ") and "前哨战" in ln for ln in _fl2), (
+    _fl2
+)  # 改版：数据行是「· 纪元　类型　节点…」
+_t, _fl3 = fmt.fmt_fissures([], flt=lambda f: False)
+assert _fl3 == ["◆ 结果：当前筛选条件下没有进行中的裂隙"], _fl3  # 改版：0 结果也是 KV 答案行
+
+# ① 时效卡：虚空商人未到 ⇒「X 后抵达」；扎里曼 Corpus / Grineer；双衍中文；标签 ≤10 字
+_t, _tl = fmt.fmt_timers(
+    [
+        ("虚空奸商", {"activation": _in(days=5, hours=12), "expiry": _in(days=7, hours=12)}),
+        ("扎里曼派系", {"expiry": _in(hours=1)}),
+        ("双衍王境", {"expiry": _in(hours=1)}),
+    ]
+)
+# ★ 2026-10-11 第二步改版：时效卡分「开放世界 / 每日 / 每周 / 其它周期」四段，行为「· 名称　内容　计时」；
+#   双衍的「悲伤/恐惧/…」情绪全名单从说明列移出（卡面只写「情绪轮换」，当前情绪看「夜灵」卡）。
+_trow = {ln.split("　")[0][2:]: ln for ln in _tl if ln.startswith("· ")}
+assert _trow["虚空商人"].endswith("后抵达") and "剩余" not in _trow["虚空商人"], _trow
+assert "Corpus / Grineer" in _trow["扎里曼号"] and "先锋" not in _trow["扎里曼号"], _trow
+assert "情绪轮换" in _trow["双衍王境"] and "Sorrow" not in _trow["双衍王境"], _trow
+assert all(len(v[1]) <= 10 for v in fmt._TIMER_DESC.values())
+print("§B11 卡面（执刑官/入侵/特惠/九重天/活动/出库/裂隙/时效）—— 断言通过")

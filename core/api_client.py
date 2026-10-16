@@ -60,6 +60,11 @@ ACRITHIS_REVISION_API = (
     "https://wiki.warframe.com/api.php?action=query&prop=revisions"
     "&titles=Acrithis/Current_Offerings&rvprop=timestamp&rvlimit=1&format=json"
 )
+# 效价加成（信条/终幕）的**真源页**：Reset 页那两段是 {{#lst:}} 跨页嵌入、走 MediaWiki
+# 解析缓存 —— 换批当天会吐**旧表**（2026-10-15 事故：00:05 对齐刷新抓到上一批，整轮数据
+# 钉死）。源页 wikitext 无解析缓存，且 A/B 两批**同页全量**（一次抓取两批齐全）。
+WIKI_RAW_CODA = "https://wiki.warframe.com/w/Coda_Weapons?action=raw"
+WIKI_RAW_TENET = "https://wiki.warframe.com/w/Tenet_Weapons?action=raw"
 # 社区快照（2026-09-25 方案④）：wiki 这两项数据都在 Cloudflare 盾后，没部署
 # FlareSolverr 的用户只能吃随包种子。于是把**服务器上已经抓到的新鲜快照**发布到
 # 公开仓的 bot-data 分支（automations/publish_community_snapshot.py），插件在
@@ -720,6 +725,76 @@ class WarframeAPIError(Exception):
     """统一的接口错误（含降级提示语）。"""
 
 
+# ---------------------------------------------------------------------------
+# 报错脱敏：异常原文（上游 URL / httpx 异常 / FlareSolverr 内网地址）只进日志，
+# 发到群里的只保留「哪个数据源 + 怎么办」。调用方：main.py 指令总入口、各 commands。
+# ---------------------------------------------------------------------------
+_ERR_URL_RE = re.compile(r"https?://[^\s'\"<>()（）\[\]，,]+")
+# IPv4（可带端口）以及 httpx/OSError 的元组写法 ('172.17.0.1', 8191)
+_ERR_IP_RE = re.compile(
+    r"\(\s*'\d{1,3}(?:\.\d{1,3}){3}'\s*,\s*\d{1,5}\s*\)|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b"
+)
+# (关键词, 对外展示的数据源名)；按顺序取第一个命中
+_ERR_SOURCES: tuple[tuple[str, str], ...] = (
+    ("flaresolverr", "FlareSolverr（CF 绕过代理）"),
+    ("warframe.market", "warframe.market"),
+    ("wm v2", "warframe.market"),
+    ("紫卡周报", "DE 官方紫卡周报"),
+    ("warframestat", "warframestat.us"),
+    ("huijiwiki", "灰机 wiki"),
+    ("wf.wiki", "arbi.wf.wiki"),
+    ("wiki.warframe", "Warframe wiki"),
+    ("valence", "Warframe wiki（言录使数据）"),
+    ("倾向表", "Warframe wiki（紫卡倾向表）"),
+    ("warframe.com", "DE 官方接口"),
+    ("世界状态", "DE 官方接口"),
+)
+# 这些前缀的报错文本里拼了上游原文（URL / 异常串 / 内网地址）⇒ 整句换成通用提示
+_ERR_RAW_PREFIXES = (
+    "请求失败（",
+    "接口不存在或暂未开放：",
+    "FlareSolverr 不可用",
+    "DE 紫卡周报拉取失败：",
+    "WM v2 接口错误：",
+    "valence ",
+    "wiki 倾向表解析异常",
+)
+
+
+def error_source(text: str) -> str:
+    """从报错原文里认出数据源名（不认识返回空串）。"""
+    low = str(text).lower()
+    for key, label in _ERR_SOURCES:
+        if key in low:
+            return label
+    return ""
+
+
+def redact_error_text(text: str) -> str:
+    """去掉文本里的 URL（换成数据源名）与 IP/端口（换成「内部地址」）。"""
+
+    def _url(m: re.Match) -> str:
+        return error_source(m.group(0)) or "上游接口"
+
+    out = _ERR_URL_RE.sub(_url, str(text))
+    return _ERR_IP_RE.sub("内部地址", out)
+
+
+def public_error_text(exc: BaseException | str) -> str:
+    """把接口异常转成可以发到群里的提示（详情由调用方写日志）。
+
+    * 本插件自己写的降级提示（限速 / 数据源停摆 / 开关关闭等）原样保留，仅兜底去 URL/IP；
+    * 拼了上游原文的（见 ``_ERR_RAW_PREFIXES``）整句换成「<数据源> 暂时不可用，请稍后再试」。
+    """
+    msg = str(exc).strip()
+    if msg.startswith(_ERR_RAW_PREFIXES):
+        src = error_source(msg) or "上游接口"
+        if msg.startswith("接口不存在或暂未开放"):
+            return f"{src} 接口不存在或暂未开放，请稍后再试"
+        return f"{src} 暂时不可用，请稍后再试"
+    return redact_error_text(msg) or "上游接口暂时不可用，请稍后再试"
+
+
 def _rank_candidate(it: dict) -> bool:
     """价格榜爬取候选（决定抓取规模与榜单口径）。
 
@@ -955,27 +1030,34 @@ class WarframeClient:
             ref = it.get("game_ref") or ""
             if ref and it.get("zh"):
                 by_ref.setdefault(ref, it["zh"])
+        from .de_worldstate import official_item_zh
+
         for a in data or []:
             rw = (a.get("mission") or {}).get("reward") or {}
             names, unknown = [], []
-            for p in rw.get("items") or []:
-                nm = store_item_zh(p)
+            paths = rw.get("items") or []
+            counts = list(rw.get("counts") or []) + [1] * len(paths)
+            for p, cnt in zip(paths, counts):
+                # 四级：装饰品反查表 → 官方词表（name_zh + WFCD i18n 补充，2026-10-16 加）
+                #   → WM gameRef → 未收录（不造名字）。数量 >1 时追加「 ×N」（同入侵段写法）。
+                nm = store_item_zh(p) or official_item_zh(p) or ""
                 if not nm:
                     nm = next(
                         (by_ref[k] for k in store_items_path_variants(p) if by_ref.get(k)), ""
                     )
+                suffix = f" ×{cnt}" if isinstance(cnt, int) and cnt > 1 else ""
                 if nm:
-                    names.append(nm)
+                    names.append(nm + suffix)
                 else:
-                    unknown.append(p.rsplit("/", 1)[-1])
+                    unknown.append((p.rsplit("/", 1)[-1], suffix))
             if names:
                 rw["item_names"] = names
                 rw["item"] = names[0]  # 中文名优先于 prettify 兜底
                 if unknown:
-                    rw["item_unknown"] = unknown
+                    rw["item_unknown"] = [t for t, _ in unknown]
             elif unknown:
                 rw["item_names"] = []
-                rw["item"] = "、".join("%s（未收录）" % t for t in unknown)
+                rw["item"] = "、".join(f"{t}（未收录）{sfx}" for t, sfx in unknown)
         return data
 
     async def invasions(self, platform: str) -> list[dict]:
@@ -1255,8 +1337,9 @@ class WarframeClient:
             "_reset_rule": snap.get("_reset_rule", ""),
             "_过期口径": snap.get("_过期口径", ""),
         }
-        paths.write_path(ACRITHIS_WEEK_NAME).write_text(
-            json.dumps(out, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
+        paths.atomic_write_text(
+            paths.write_path(ACRITHIS_WEEK_NAME),
+            json.dumps(out, ensure_ascii=False, indent=1) + "\n",
         )
         logger.info(
             "[sdjk] 言录使本周货单已自动刷新（observed %s，%d 件）", parsed["observed"], len(items)
@@ -1293,8 +1376,9 @@ class WarframeClient:
                 or "社区快照（wiki《Acrithis/Current Offerings》经有 FS 的机器发布）"
             ),
         }
-        paths.write_path(ACRITHIS_WEEK_NAME).write_text(
-            json.dumps(out, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
+        paths.atomic_write_text(
+            paths.write_path(ACRITHIS_WEEK_NAME),
+            json.dumps(out, ensure_ascii=False, indent=1) + "\n",
         )
         logger.info(
             "[sdjk] 言录使本周货单已从社区快照刷新（observed %s，%d 件）",
@@ -1434,29 +1518,6 @@ class WarframeClient:
                 if ref and not ev.get("name"):
                     ev["name"] = by_ref.get(ref) or ev.get("name")
         return data
-
-    async def search_items(self, query: str) -> list[dict]:
-        """物品搜索：WM v2 字典本地匹配（zh/en 包含）。"""
-        items = await self.wm_items()
-        q = query.strip().lower()
-        hits = []
-        for it in items:
-            hay = f"{it.get('zh', '')} {it.get('en', '')} {it.get('url_name', '')}".lower()
-            if q in hay:
-                hits.append(
-                    {
-                        "name": it.get("zh") or it.get("en") or it.get("url_name"),
-                        "category": (it.get("tags") or ["item"])[0],
-                        "description": (
-                            f"{it['ducats']} 杜卡德"
-                            if it.get("ducats")
-                            else ("可交易" if it.get("tradable") else "")
-                        ),
-                    }
-                )
-            if len(hits) >= 8:
-                break
-        return hits
 
     # ------------------------------------------------------------------
     # Warframe.Market v2：物品字典 / 订单
@@ -1878,9 +1939,7 @@ class WarframeClient:
     @staticmethod
     def _save_json_file(path, payload) -> None:
         try:
-            Path(path).write_text(
-                json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
-            )
+            paths.atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=1))
         except Exception:  # noqa: BLE001 - 落盘失败不影响本次查询
             pass
 
@@ -2092,7 +2151,9 @@ class WarframeClient:
             "type": "riven",
             "weapon_url_name": weapon_url_name,
             "platform": platform,
-            "buyout_policy": "direct",
+            # ★ 2026-10-08（用户口径）：「也打开」——不再只收一口价直购，
+            #   竞价型（只有起拍价、无 buyout）挂单也列出来；卡片上这类价格前标「起」
+            #   以示区别（见 fmt_wr_auctions）。
         }
         pos = list(dict.fromkeys(positives))
         neg = list(dict.fromkeys(negatives))
@@ -2582,6 +2643,12 @@ class WarframeClient:
         if not query:
             return None
         weapons = await self.wm_riven_weapons()
+        # 官方全名精确命中先于「p = Prime」简写：英文名本身以 p 结尾的武器
+        # （如 Arbucep）此前会被拆成「Arbuce + p」再找 Prime 变体 ⇒ 查不到
+        _low0 = query.lower().replace(" ", "_")
+        for w in weapons:
+            if w.get("zh") == query or (w.get("en") or "").lower().replace(" ", "_") == _low0:
+                return w
         m = self._PRIME_SUFFIX.match(query)
         if m and len(m.group(1).strip()) >= 1:
             base = await self.resolve_riven_weapon(m.group(1).strip())
@@ -2589,6 +2656,10 @@ class WarframeClient:
                 # 2026-09-23 去掉「回落 base」：倾向/紫卡按变体分别计算，
                 # 表中确无该变体条目时返回 None（未找到），绝不冒充本体值。
                 # ★ 市场路径（wr）按用户口径另行「剥到母武器」，见 market.py::_h_wr。
+                # 母名本身已解析到 Prime 条目（只有 Prime 版的武器，如「悦音」→ 悦音 Prime）
+                # ⇒ 「悦音p」就是它，不再去找「Prime 的 Prime」
+                if matching.normalize(base.get("en") or "").endswith("prime"):
+                    return base
                 return matching.prime_sibling(base, weapons)
         # ★ 2026-10-01：**官方名精确匹配先于别名词典**。别名表的「双向包含」
         #   会让官方名被别名键捞走：实测「盗贼」(Furis, 1.35) 命中别名键
@@ -2627,6 +2698,18 @@ class WarframeClient:
         for w in weapons:
             if low in w.get("url_name", "") or query in (w.get("zh") or ""):
                 return w
+        # 归一化子串（**唯一命中才采纳**）：玩家常省略官方名里的间隔号 / 后缀，
+        #   如「赤毒努寇」「信条弧电」——上一步按原文比，「赤毒努寇」不是
+        #   「赤毒·努寇微波枪」的子串（中间隔着「·」）。多个命中时不猜，交给后面的模糊兜底。
+        if nq and len(nq) >= 2:
+            sub = [
+                w
+                for w in weapons
+                if nq in matching.normalize(w.get("zh") or "")
+                or nq in matching.normalize(w.get("en") or "")
+            ]
+            if len({w.get("url_name") for w in sub}) == 1:
+                return sub[0]
         close = difflib.get_close_matches(
             low, [w.get("url_name", "") for w in weapons], n=1, cutoff=0.7
         )
@@ -2664,12 +2747,6 @@ class WarframeClient:
                 if w.get("url_name") == falias:
                     return w
         return None
-
-    async def suggest_wm_items(self, query: str, n: int = 3) -> list[str]:
-        """给「未找到」的 wm 物品查询提供中文名候选。"""
-        items = await self.wm_items()
-        names = [(it.get("zh") or it.get("en") or it.get("url_name", "")) for it in items]
-        return fuzzy_hits(query, names, n=n)
 
     _VEILED_SLUGS = {
         "Melee": "melee_riven_mod_(veiled)",
@@ -2900,6 +2977,79 @@ class WarframeClient:
         )
         return {"tenet": tenet, "coda_batch": m.group(1) if m else "", "coda": coda}
 
+    # ★ 2026-10-15：**源页 wikitext** 解析（Coda_Weapons / Tenet_Weapons ``?action=raw``）。
+    #   与上面的 ``parse_wiki_valence``（Reset **渲染页**）相对：渲染页那两张表是
+    #   ``{{#lst:}}`` 跨页嵌入、走 MediaWiki **解析缓存**，换批当天会吐**旧表**
+    #   （2026-10-15 事故：对齐到 00:05 的刷新抓到上一批，anchor 反解成 1、整轮
+    #   数据钉死）；源页是真源、**无解析缓存**，且 A/B 两批**同页全量**。
+    @staticmethod
+    def _wt_plain(cell: str) -> str:
+        """wikitext 单元格 → 纯文本（模板壳由 ``_weapon_row_wt`` 再剥）。"""
+        import html as _h
+
+        txt = re.sub(r"<[^>]+>", " ", cell)
+        return re.sub(r"\s+", " ", _h.unescape(txt)).strip()
+
+    @classmethod
+    def _weapon_row_wt(cls, row: str) -> dict:
+        """源页数据行 → ``{en, element, bonus}``。
+
+        行形如 ``<tr><td>Coda Hema</td><td>{{D|Magnetic}}</td>
+        <td>{{ValenceBonusPercentageColor|34.2}}</td></tr>``；Tenet 页名字带
+        ``{{Weapon|Tenet Ferrox}}`` 壳。
+        """
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)
+        out = {"en": "", "element": "", "bonus": None}
+        if cells:
+            m = re.search(r"\{\{\s*Weapon\s*\|\s*([^}|]+?)\s*\}\}", cells[0])
+            out["en"] = m.group(1) if m else cls._wt_plain(cells[0])
+        if len(cells) > 1:
+            m = re.search(r"\{\{\s*D\s*\|\s*([^}|]+?)\s*\}\}", cells[1])
+            out["element"] = m.group(1) if m else cls._wt_plain(cells[1])
+        if len(cells) > 2:
+            m = re.search(r"ValenceBonusPercentageColor\s*\|\s*([\d.]+)", cells[2]) or re.search(
+                r"([\d.]+)", cls._wt_plain(cells[2])
+            )
+            out["bonus"] = float(m.group(1)) if m else None
+        return out
+
+    @classmethod
+    def parse_wikitext(cls, src: str) -> dict:
+        """解析 Coda Weapons / Tenet Weapons 源页的 wikitext（真源，无解析缓存）。
+
+        ``?action=raw`` 的响应是 ``<pre>`` 包裹、实体转义过的 wikitext ⇒ 先
+        ``html.unescape``。返回 ``{"coda": {1: [{en,element,bonus}…], 2: […]},
+        "tenet": [ … ]}`` —— coda 的键是**批次号**（1=A、2=B），两批同页全量。
+        """
+        import html as _h
+
+        src = _h.unescape(src)
+        res: dict = {"coda": {}, "tenet": []}
+        for tm in re.finditer(r"<table[^>]*>", src):
+            start = tm.end()
+            end = src.find("</table>", start)
+            if end < 0:
+                continue
+            rows = re.findall(r"<tr[^>]*>(.*?)</tr>", src[start:end], re.S)
+            heads = [r for r in rows if "<th" in r]  # 表头行（<th>）
+            data = [r for r in rows if len(re.findall(r"<td", r)) >= 3]
+            if not heads or not data:
+                continue
+            head = re.sub(r"<[^>]+>", " ", heads[0])
+            head = re.sub(r"\s+", " ", _h.unescape(head)).strip()
+            mb = re.match(r"Weapon\s*\(Batch\s*([AB])\)", head, re.I)
+            if mb:
+                res["coda"][{"A": 1, "B": 2}[mb.group(1).upper()]] = [
+                    cls._weapon_row_wt(r) for r in data
+                ]
+                continue
+            if head.lower().startswith("weapon"):  # 无批次后缀 = Tenet（Ergo Glast）
+                items = [cls._weapon_row_wt(r) for r in data]
+                items = [it for it in items if (it["en"] or "").lower().startswith("tenet")]
+                if items:
+                    res["tenet"] = items
+        return res
+
     @staticmethod
     def valence_is_stale(data: dict, now=None) -> bool:
         """该段的效价快照是否已过期（不在当前轮次窗口内）。
@@ -2981,7 +3131,16 @@ class WarframeClient:
         return parsed
 
     async def refresh_valence(self, community_only: bool = False) -> str:
-        """检查并刷新信条/终幕元素加成快照（数据源 wiki Reset 页）。
+        """检查并刷新信条/终幕元素加成快照。
+
+        ★ 2026-10-15 数据源改为**源页 wikitext**（``Coda_Weapons`` /
+        ``Tenet_Weapons`` 的 ``?action=raw``）。原先走 Reset **渲染页**，而那段是
+        ``{{#lst:}}`` 跨页嵌入、受 MediaWiki 解析缓存影响 —— 换批当天会吐**旧表**
+        （2026-10-15 事故：对齐到 00:05 的刷新抓到上一批，anchor 反解成 1、整轮
+        数据钉死）。源页是真源、无解析缓存，且 **A/B 两批同页全量** ⇒ 两批都能
+        填值（旧实现只填当前批、把另一批的 element/bonus 清空）。
+        当前批**由 epoch+anchor 计算**（``(anchor_idx + 换轮次数) % 批数``），不再
+        从页面反解 —— 页面那份不可靠；anchor_idx 是**相位基准**，只在首次标定时改。
 
         ``community_only=True``（FS 关闭/不可达时由后台循环调用）：**不碰
         FlareSolverr**，直接用公开仓社区快照；取不到就返回 "no-community" 静默跳过。
@@ -2989,7 +3148,7 @@ class WarframeClient:
         幂等：快照仍在当前 96h 轮次内则直接返回「fresh」不动文件。
         校验失败（解析残缺）抛异常，绝不写半成品。
         """
-        from datetime import datetime, timezone
+        from datetime import datetime, timedelta, timezone
 
         rot_path = paths.read_path("rotations.json")
         rot = json.loads(rot_path.read_text(encoding="utf-8"))
@@ -3002,72 +3161,100 @@ class WarframeClient:
         _sections = [rot.get(k) for k in ("tenet", "coda")]
         if not any(self.valence_is_stale(s, now) for s in _sections if s):
             return "fresh"
+
+        tenet_data = rot.get("tenet") or {}
+        coda_data = rot.get("coda") or {}
+        labels = coda_data.get("batch_label") or ["A", "B"]
+        batches = coda_data.get("batches") or []
+        if len(batches) != len(labels):
+            raise WarframeAPIError("valence 批次表与标签数不一致")
+
         used_community = False
+        # 归一形：tenet {en: (elem, pct)}、coda {批次号(1-based): {en: (elem, pct)}}
         if community_only:
-            parsed = await self._community_valence_parsed(rot)
-            if parsed is None:
+            raw = await self._community_valence_parsed(rot)
+            if raw is None:
                 return "no-community"
             used_community = True
         else:
             try:
-                html = await self.fetch_via_flaresolver(
-                    "https://wiki.warframe.com/w/Reset", ttl=600
+                p_coda = self.parse_wikitext(
+                    await self.fetch_via_flaresolver(WIKI_RAW_CODA, ttl=600)
                 )
-                parsed = self.parse_wiki_valence(html)
+                p_tenet = self.parse_wikitext(
+                    await self.fetch_via_flaresolver(WIKI_RAW_TENET, ttl=600)
+                )
+                raw = None
             except Exception as exc:  # noqa: BLE001
                 # ★ 没部署 / 连不上 FlareSolverr 时的兜底：读公开仓 bot-data 的
                 #   社区快照（同一份 wiki 数据，由有 FS 的那台机器发布）。校验不过
                 #   就照旧抛错（调用方降级），绝不采用残缺或更旧的数据。
-                logger.info("[sdjk] 元素加成 wiki 不可用（%s），尝试社区快照", exc)
-                parsed = await self._community_valence_parsed(rot)
-                if parsed is None:
+                logger.info("[sdjk] 元素加成源页不可用（%s），尝试社区快照", exc)
+                raw = await self._community_valence_parsed(rot)
+                if raw is None:
                     raise
                 used_community = True
-        tenet_data = rot.get("tenet") or {}
-        coda_data = rot.get("coda") or {}
+
+        if used_community:
+            cb = raw.get("coda_batch") or ""
+            if cb not in labels:
+                raise WarframeAPIError(f"valence 批次标注异常：{cb!r}")
+            parsed = {"tenet": raw["tenet"], "coda": {labels.index(cb) + 1: raw["coda"]}}
+        else:
+            parsed = {
+                "tenet": {it["en"]: (it["element"], it["bonus"]) for it in p_tenet["tenet"]},
+                "coda": {
+                    idx: {it["en"]: (it["element"], it["bonus"]) for it in items}
+                    for idx, items in p_coda["coda"].items()
+                },
+            }
+            if not parsed["tenet"]:  # 兜底：源文件顺序与预期相反也能解析
+                parsed["tenet"] = {it["en"]: (it["element"], it["bonus"]) for it in p_coda["tenet"]}
+            if not parsed["coda"]:
+                parsed["coda"] = {
+                    idx: {it["en"]: (it["element"], it["bonus"]) for it in items}
+                    for idx, items in p_tenet["coda"].items()
+                }
+
         want_t = {it.get("en") for it in tenet_data.get("items") or []}
         if not want_t or not want_t <= set(parsed["tenet"]):
             raise WarframeAPIError(f"valence 解析不全：tenet 缺 {want_t - set(parsed['tenet'])}")
-        labels = coda_data.get("batch_label") or ["A", "B"]
-        batches = coda_data.get("batches") or []
-        batch = parsed["coda_batch"]
-        if batch not in labels or len(batches) != len(labels):
-            raise WarframeAPIError(f"valence 批次标注异常：{batch!r}")
-        bi = labels.index(batch)
-        coda_data["anchor_idx"] = self.coda_anchor_for(
-            bi,
-            datetime.fromisoformat(coda_data["epoch"]),
-            int(coda_data.get("period_hours", 96)),
-            now,
-            len(batches),
-        )
+
+        # 当前批 = **计算**（anchor_idx 是相位基准；不读页面 —— 页面那份受缓存影响不可靠）
+        epoch = datetime.fromisoformat(coda_data["epoch"])
+        period = timedelta(hours=int(coda_data.get("period_hours", 96)))
+        passed = int((now - epoch) // period)
+        bi = (int(coda_data.get("anchor_idx", 0)) + passed) % len(batches)
         want_c = {it.get("en") for it in batches[bi]}
-        if not want_c <= set(parsed["coda"]):
+        if not want_c <= set(parsed["coda"].get(bi + 1, {})):
             raise WarframeAPIError(
-                f"valence 解析不全：coda {batch} 批缺 {want_c - set(parsed['coda'])}"
+                f"valence 解析不全：coda {labels[bi]} 批缺 "
+                f"{want_c - set(parsed['coda'].get(bi + 1, {}))}"
             )
+
         snap = now.replace(microsecond=0).isoformat()
         for it in tenet_data.get("items") or []:
             elem, pct = parsed["tenet"][it["en"]]
             it["element"], it["bonus"] = elem, pct
-        coda_data["valence_snapshot"] = snap
+        # ★ A/B 两批都给值（源页两批同页全量）；缺的那批保留原值，不清空
         for idx, b_items in enumerate(batches):
+            table = parsed["coda"].get(idx + 1) or {}
             for it in b_items:
-                if idx == bi:
-                    elem, pct = parsed["coda"][it["en"]]
+                if it.get("en") in table:
+                    elem, pct = table[it["en"]]
                     it["element"], it["bonus"] = elem, pct
-                else:
-                    it.pop("element", None)
-                    it.pop("bonus", None)
         tenet_data["valence_snapshot"] = snap
+        coda_data["valence_snapshot"] = snap
         if used_community:
             src = "community-snapshot（wiki《Reset》数据，由有 FS 的机器发布）"
-            tenet_data["valence_source"] = src
-            coda_data["valence_source"] = src
-        paths.write_path("rotations.json").write_text(
-            json.dumps(rot, ensure_ascii=False, indent=1), encoding="utf-8"
+        else:
+            src = "wiki 源页 wikitext（Coda_Weapons / Tenet_Weapons，经 FlareSolverr）"
+        tenet_data["valence_source"] = src
+        coda_data["valence_source"] = src
+        paths.atomic_write_text(
+            paths.write_path("rotations.json"), json.dumps(rot, ensure_ascii=False, indent=1)
         )
-        return f"refreshed {snap} batch={batch}" + ("(community)" if used_community else "")
+        return f"refreshed {snap} batch={labels[bi]}" + ("(community)" if used_community else "")
 
     @staticmethod
     def parse_wiki_dispositions(html: str) -> dict:
@@ -3134,10 +3321,36 @@ class WarframeClient:
             "snapshot": now,
             "disp": disp,
         }
-        paths.write_path(WIKI_DISP_NAME).write_text(
-            json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
+        paths.atomic_write_text(
+            paths.write_path(WIKI_DISP_NAME), json.dumps(meta, ensure_ascii=False, indent=1)
         )
         return f"refreshed {len(disp)} 条 @ {now}"
+
+    async def nearmiss_riven_weapons(self, query: str, n: int = 4) -> list[dict]:
+        """与 ``query`` **等长且恰有 1 个字不同** 的紫卡武器（近形字候选）。
+
+        ★ 2026-10-07 为何需要它：`fuzzy_hits` 的 2 字档阈值 0.75，而两个字
+        「只差一个」的 difflib ratio 恰好 **0.5** ⇒ 永远命中不了。线上报障
+        （2026-10-07 三次：10:59 / 17:11 / 17:13）卡面「冰凇」被 OCR 读成
+        「冰松」⇒ 纯图路径整卡失败（该卡无手输名可兜底）。
+
+        这里只做**候选生成**（字面近似），是否采纳交给调用方用**卡面数值可行性**
+        （`riven_analysis.disp_feasible`）当闸门 —— 保证不是纯字面替换：表里
+        真实存在的近形对（如 绝路/绝望）也会被列出来，可行性能挡住错配。
+        """
+        q = (query or "").strip()
+        if len(q) < 2:
+            return []
+        out: list[dict] = []
+        for w in await self.wm_riven_weapons():
+            zh = (w.get("zh") or "").strip()
+            if not zh or len(zh) != len(q):
+                continue
+            if sum(1 for a, b in zip(zh, q) if a != b) == 1:
+                out.append(w)
+                if len(out) >= n:
+                    break
+        return out
 
     async def suggest_riven_weapons(self, query: str, n: int = 3) -> list[str]:
         """给「未找到」的紫卡武器查询提供候选。

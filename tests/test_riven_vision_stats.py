@@ -25,6 +25,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
+def _txt(r) -> str:
+    """Reply 的可读文本：raw_text 或 title + lines（报错卡片迁移后断言用）。"""
+    if r is None:
+        return ""
+    return r.raw_text or (r.title + "\n" + "\n".join(r.lines))
+
+
 def _install_astrbot_stub() -> None:
     if "astrbot" in sys.modules:
         return
@@ -536,20 +543,21 @@ check(
 )
 check(
     "★ 四条词条按卡面行原文配对：120.5 毒伤 / 299.9 基伤 / 148 多重",
-    all(k in _body for k in ("120.5% 毒伤", "299.9% 基伤", "148% 多重")),
+    all(k in _body for k in ("▲毒伤 +120.5%", "▲基伤 +299.9%", "▲多重 +148%")),
     _body[:300],
 )
 check(
     "★ 反向守卫：不再按语义表交叉配错（120.5 基伤 / 299.9 毒伤）",
-    "120.5% 基伤" not in _body and "299.9% 毒伤" not in _body,
+    "▲基伤 +120.5%" not in _body and "▲毒伤 +299.9%" not in _body,
     _body[:300],
 )
 check(
     "★ 负词条 = 触时 97.2（不再冒出「滑暴」）",
-    "-97.2% 触时" in _body and "滑暴" not in _body,
+    "▼触时 -97.2%" in _body and "滑暴" not in _body,
     _body[:300],
 )
-check("卡面注明来源为「卡面逐行」而不是语义表", "卡面逐行" in _body, _body[:220])
+# 2026-10-11 改版：来源说明进页脚（不再占卡面注脚行）
+check("页脚注明来源为「卡面逐行」而不是语义表", "卡面逐行" in _reply.footer, _reply.footer)
 
 
 # 拿不到 lines（渠道/模型没给这个字段）⇒ 安全退回语义 JSON，不崩
@@ -561,7 +569,7 @@ _obj._extract_riven_from_image = _fake_extract_nolines
 _r2 = asyncio.run(_obj._h_riven_analysis(_FatParsed("紫卡分析"), _FakeImageEvent(), "pc"))
 check(
     "没给 lines 时退回语义 JSON（不崩，仍按原判据提示词条数）",
-    bool(_r2.raw_text) and "词条应为" in _r2.raw_text,
+    "词条应为" in _txt(_r2) and "怎么改" in _txt(_r2),
     repr(_r2)[:200],
 )
 
@@ -687,7 +695,7 @@ check(
 )
 check(
     "★ 四条词条全部进卡：暴伤 91.1 / I伤 51 / 初始连击 29.6 / 处决伤 115.7",
-    all(k in _body3 for k in ("+91.1% 暴伤", "+51% I伤", "+29.6 初始连击", "-115.7% 处决伤")),
+    all(k in _body3 for k in ("▲暴伤 +91.1%", "▲I伤 +51%", "▲初始连击 +29.6", "▼处决伤 -115.7%")),
     _body3[:400],
 )
 check("★ 不再误报「与家族已知倾向都不吻合」（旧故障串）", "都不吻合" not in _body3, _body3[:300])
@@ -698,7 +706,7 @@ check(
 )
 check(
     "★ 卡面按 1.2 计算区间（不是不吻合的母武器 1.3）",
-    "【空刃】倾向 1.2" in _body3 and "倾向 1.3" not in _body3,
+    "武器：空刃｜倾向 1.2" in _body3 and "倾向 1.3" not in _body3,
     _body3[:200],
 )
 check(
@@ -859,7 +867,7 @@ check(
     "★ 别名：DE 卡面原文「的几率来获得连击数」→ combo_gain_chance",
     plugin.WarframeSDJK._stat_id_from_name("的几率来获得连击数", _rev) == "combo_gain_chance",
 )
-# ★ 2026-10-02 归并（用户拍板）：幽灵 sid combo_efficiency（「连击效率」，
+# ★ 2026-10-02 归并（口径统一）：幽灵 sid combo_efficiency（「连击效率」，
 #   基值恰好等于额外连击数几率）并入 extra_combo_count；三处表都不再有它。
 check(
     "★ 归并：连击效率 / 近战连击效率 → extra_combo_count",
@@ -1026,6 +1034,338 @@ check(
     "⑪ 窄读 prompt：改守「先数行数」的计数框架（S6 下负词条/图标行都不丢）",
     "有几行词条" in _line_prompt,
     _line_prompt,
+)
+
+# ---------------------------------------------------------------------------
+# ⑫ 武器名解析优先级：手输名优先 + OCR 名兜底（2026-10-07 线上报障回归）
+# ---------------------------------------------------------------------------
+# 报障（线上日志 10-07 10:59 / 17:11 / 17:13 三次）：
+#   `[图片] 紫卡分析 冰凇` → 回「未找到紫卡武器「冰松」」。
+# 根因：卡面首行被 OCR 读成**近形字**「冰松」（实为冰凇 Verglas），而旧实现
+#   `weapon_name = data.get("weapon") or weapon_name` 让 **OCR 名无条件覆盖手输名**
+#   ⇒ 用户写对的名字被丢掉、整卡失败。现改为「手输名优先，认不出时再用 OCR 名兜底」。
+# 数值沿用 ⑥ 号回归的夹具（该卡能走通出卡），本段的判据**只关心解析用的是哪个名字**。
+
+
+class _RecClient:
+    """记录每次解析传入的武器名；「冰凇」可解析、「冰松」不可（复刻线上形态）。"""
+
+    _weapon = dict(_FakeRivenClient._weapon)
+    _weapon.update({"url_name": "verglas", "zh": "冰凇", "en": "Verglas"})
+
+    def __init__(self):
+        self.queries = []
+
+    async def resolve_riven_weapon(self, q):
+        self.queries.append(q)
+        return dict(self._weapon) if q == "冰凇" else None
+
+    async def resolve_variant_disp(self, name):
+        return (None, "")
+
+    async def riven_family(self, weapon):
+        return []
+
+    async def suggest_riven_weapons(self, q, n=3):
+        return []
+
+    async def wm_riven_weapons(self):
+        return [dict(self._weapon)]  # 近形字兜底的候选池（⑬ 段用）
+
+    async def nearmiss_riven_weapons(self, q, n=4):
+        out = []
+        for w in await self.wm_riven_weapons():
+            zh = (w.get("zh") or "").strip()
+            if zh and len(zh) == len(q) and sum(1 for a, b in zip(zh, q) if a != b) == 1:
+                out.append(w)
+        return out[:n]
+
+
+# 识别结果里的 weapon 就是线上那条「冰松 Visi-critapha」
+_iceq_vision = dict(_incident_vision, weapon="冰松 Visi-critapha")
+# 对照：同一张卡但 OCR 读对（纯图路径用）
+_iceq_vision_ok = dict(_incident_vision, weapon="冰凇 Visi-critapha")
+
+
+def _rec_obj(vision: dict):
+    o = plugin.WarframeSDJK.__new__(plugin.WarframeSDJK)
+    o.client = _RecClient()
+    o.page_size = 12
+    o._image_data_urls = _fake_imgs
+
+    async def _ext(_u):
+        return dict(vision)
+
+    o._extract_riven_from_image = _ext
+    return o
+
+
+# A：手输名对（冰凇）+ OCR 读错（冰松）⇒ 必须用手输名解析
+_objA = _rec_obj(_iceq_vision)
+_rA = asyncio.run(_objA._h_riven_analysis(_FatParsed("紫卡分析 冰凇"), _FakeImageEvent(), "pc"))
+check(
+    "⑫① 手输名优先：解析用的是「冰凇」，不是 OCR 的「冰松」",
+    _objA.client.queries[:1] == ["冰凇"],
+    str(_objA.client.queries),
+)
+check(
+    "⑫② 该卡出卡（不再是「未找到紫卡武器」）",
+    bool(_rA.lines) and not _rA.raw_text,
+    repr(_rA)[:200],
+)
+
+# B：手输名写错（冰松）+ 卡面读对（冰凇）⇒ OCR 名兜底那一跳要接住
+#   （用读音对照件：反过来才是「手输对、卡面读错」，见情形 A）
+_objB = _rec_obj(_iceq_vision_ok)
+_rB = asyncio.run(_objB._h_riven_analysis(_FatParsed("紫卡分析 冰松"), _FakeImageEvent(), "pc"))
+check(
+    "⑫③ OCR 名兜底：手输名认不出时，用卡面名「冰凇」再试一次",
+    _objB.client.queries == ["冰松", "冰凇"],
+    str(_objB.client.queries),
+)
+check(
+    "⑫④ 兜底后同样出卡",
+    bool(_rB.lines) and not _rB.raw_text,
+    repr(_rB)[:200],
+)
+
+# C：纯图路径（不输名）行为不变 —— 仍按 OCR 名解析（此例 OCR 读对）
+_objC = _rec_obj(_iceq_vision_ok)
+_rC = asyncio.run(_objC._h_riven_analysis(_FatParsed("紫卡分析"), _FakeImageEvent(), "pc"))
+check(
+    "⑫⑤ 纯图路径不变：仍用卡面识别名解析、且出卡",
+    _objC.client.queries[:1] == ["冰凇"] and bool(_rC.lines),
+    f"{_objC.client.queries} / {repr(_rC)[:120]}",
+)
+
+# ---------------------------------------------------------------------------
+# ⑬ 近形字兜底（卡面数值可行性当闸门）—— 纯图路径被 OCR 读错时的自愈
+# ---------------------------------------------------------------------------
+# ⑫ 修好的是「用户手输了名字」的情形；**纯图路径（不输名）没有手输名可用**，
+# 只能靠这一跳自愈（线上 10-07 三次报障正是这种卡：冰凇 被读成 冰松）。
+_objD = _rec_obj(_iceq_vision)  # weapon = 冰松 Visi-critapha，表内只有「冰凇」
+_rD = asyncio.run(_objD._h_riven_analysis(_FatParsed("紫卡分析"), _FakeImageEvent(), "pc"))
+_bodyD = "\n".join(_rD.lines)
+check(
+    "⑬① 纯图路径：OCR 读成近形字也能出卡（不再是「未找到」）",
+    bool(_rD.lines) and not _rD.raw_text,
+    repr(_rD)[:200],
+)
+check(
+    "⑬② 卡面注明识别名与实际计算名（数值可行性闸门通过才采纳）",
+    "已按「冰凇」计算" in _bodyD,
+    _bodyD[:300],
+)
+
+# ---------------------------------------------------------------------------
+# ⑭ 「多个近形候选都可行」⇒ 不猜：列进候选提示、不出卡
+# ---------------------------------------------------------------------------
+# 桩数据（名字为合成，只为触发分支）：OCR 读成「七星刃」，表里两个**等长 + 1 字差**
+# 的候选（七星刀 / 七星剑）倾向都是 1.4 ⇒ 数值都能解释卡面 ⇒ 必须**不采纳**。
+_vision_multi = dict(_incident_vision, weapon="七星刃 Seven-star")
+
+
+class _MultiNearClient(_RecClient):
+    _w1 = dict(_RecClient._weapon, url_name="nr1", zh="七星刀", en="Near One")
+    _w2 = dict(_RecClient._weapon, url_name="nr2", zh="七星剑", en="Near Two")
+
+    async def wm_riven_weapons(self):
+        return [dict(self._w1), dict(self._w2)]
+
+
+_objE = plugin.WarframeSDJK.__new__(plugin.WarframeSDJK)
+_objE.client = _MultiNearClient()
+_objE.page_size = 12
+_objE._image_data_urls = _fake_imgs
+
+
+async def _extE(_u):
+    return dict(_vision_multi)
+
+
+_objE._extract_riven_from_image = _extE
+_rE = asyncio.run(_objE._h_riven_analysis(_FatParsed("紫卡分析"), _FakeImageEvent(), "pc"))
+check(
+    "⑭① 多个近形候选都可行 ⇒ 不猜（仍回未找到、不出卡）",
+    "未找到紫卡武器" in _txt(_rE),
+    repr(_rE)[:200],
+)
+check(
+    "⑭② 两个可行候选都列进提示",
+    "七星刀" in _txt(_rE) and "七星剑" in _txt(_rE),
+    _txt(_rE)[:200],
+)
+
+# ---------------------------------------------------------------------------
+# ⑮ 紫卡识别**不竞速**：只取一个渠道（用户 2026-10-07 裁示"宁慢不赌"）
+# ---------------------------------------------------------------------------
+# 2026-10-07 起因：同张「冰凇」卡 × 各 5 次 —— glm-4v-flash → 冰松 5/5（读错且最快
+#   ⇒ 竞速里必赢）；30B 2/5；8B 5/5 ⇒ 紫卡路只发一个渠道。识卡那路保留原竞速。
+# 2026-10-12 订正选渠道口径：**不再无条件挑 8B**，改为信任 `_vision_providers()`
+#   的排序（它已把面板配置的 `vision_provider_id` 排在首位；没配置时才轮到内置
+#   候选优先级）。旧实现把面板配置对整个紫卡路**静默失效**（用户实测：配置改 30B、
+#   重载两次，紫卡仍打印"固定渠道 8B"）。换 30B 的依据见 vision.py 内注释
+#   （bench3：65/70 vs 62/70、perfect 15 vs 12、9.1 s vs 18.3 s）。
+#   ⚠ 本组用例只锚定「怎么取渠道」；"配置了 X 就发 X"由 `_vision_providers()` 自身
+#   的单测（`test_vision_providers` 若存在）+ 线上日志共同覆盖。
+
+
+class _Prov:
+    def __init__(self, pid):
+        self._pid = pid
+
+    def meta(self):
+        return types.SimpleNamespace(id=self._pid)
+
+
+_seen = {}
+
+
+class _OrderStub:
+    def __init__(self, provs):
+        self._provs = provs
+
+    def _vision_providers(self):
+        return list(self._provs)
+
+    async def _vision_race_json(self, prompt, image_url, provs, **kw):
+        _seen["order"] = [_p.meta().id for _p in provs]
+        return None
+
+
+def _raced_with(prov_ids):
+    _seen.clear()
+    obj = plugin.WarframeSDJK.__new__(plugin.WarframeSDJK)
+    stub = _OrderStub([_Prov(i) for i in prov_ids])
+    obj._vision_providers = stub._vision_providers
+    obj._vision_race_json = stub._vision_race_json
+    asyncio.run(obj._extract_riven_from_image("data:image/png;base64,x"))
+    return _seen.get("order", [])
+
+
+check(
+    "⑮① 紫卡路只传一个渠道（不竞速）：候选首个 = 配置渠道时，发它且只发它",
+    _raced_with(
+        [
+            "siliconflow/Qwen/Qwen3-VL-30B-A3B-Instruct",
+            "zhipu/glm-4v-flash",
+            "siliconflow/Qwen/Qwen3-VL-8B-Instruct",
+        ]
+    )
+    == ["siliconflow/Qwen/Qwen3-VL-30B-A3B-Instruct"],
+    str(_seen),
+)
+check(
+    "⑮② 候选序为 [glm, 8B] 时照发首位（不再按名字回落 8B——用户 2026-10-12 裁示去定死）",
+    _raced_with(
+        [
+            "zhipu/glm-4v-flash",
+            "siliconflow/Qwen/Qwen3-VL-8B-Instruct",
+        ]
+    )
+    == ["zhipu/glm-4v-flash"],
+    str(_seen),
+)
+check(
+    "⑮③ 候选为空：不猜渠道、不发请求（交调用方按无渠道报错）",
+    _raced_with([]) == [],
+    str(_seen),
+)
+
+# ---------------------------------------------------------------------------
+# ⑯ ★ 2026-10-14 P0 回归：视觉模型 positive/negative 的**元素形状**漂移
+#    —— 线上「紫卡分析 + 截图」连续报「⚠️ 内部错误」（`main.py` 兜底 except）。
+#    根因：旧 `_normalize_llm_stats` 用 `to_stat(*item)`，假定每条都是二元序列。
+#      · 整条扁平 `["变焦", "60.8"]`：迭代拿到裸字符串，`*item` 按字符拆成
+#        4/5/6 个位置参数 ⇒ TypeError ⇒ 整条指令崩（线上 4 次：10-03 缺 val /
+#        10-12 5 个 / 10-14 4 个、6 个）。
+#      · 元素是字典 `{"name":..,"value":..}`（或中文键 `词条缩写/数值`）：
+#        `*item` 解包的是**键** ⇒ to_stat 恒 None ⇒ 词条静默全丢
+#        （日志实证：`模型语义表 0 正 0 负`，仅靠卡面逐行那路兜住才没翻车）。
+#    修法：新增 `_iter_stat_pairs()` 先把容器归一成 [(名, 值)]，认不出的条目跳过。
+#    本组把线上四种形状各冻一条，并守住「正常嵌套不回归」。
+# ---------------------------------------------------------------------------
+check(
+    "⑯⓪ 形状归一化：正常嵌套 [['名', 值], ...] 不受影响（不回归）",
+    _S._iter_stat_pairs([["多重射击", "148"], ["毒素伤害", 299.9]])
+    == [("多重射击", "148"), ("毒素伤害", 299.9)],
+    str(_S._iter_stat_pairs([["多重射击", "148"], ["毒素伤害", 299.9]])),
+)
+check(
+    "⑯① 形状归一化：整条扁平 ['名', 值] → 一条（不再按字符拆爆）",
+    _S._iter_stat_pairs(["变焦", "60.8"]) == [("变焦", "60.8")],
+    str(_S._iter_stat_pairs(["变焦", "60.8"])),
+)
+check(
+    "⑯② 形状归一化：整条扁平多组 ['名', 值, '名', 值] → 两条",
+    _S._iter_stat_pairs(["多重射击", "122.4%", "病毒伤害", "104.3%"])
+    == [("多重射击", "122.4%"), ("病毒伤害", "104.3%")],
+    str(_S._iter_stat_pairs(["多重射击", "122.4%", "病毒伤害", "104.3%"])),
+)
+check(
+    "⑯③ 形状归一化：字典英文键 {name,value} → 一条",
+    _S._iter_stat_pairs([{"name": "冰冻伤害", "value": "+40.7%"}]) == [("冰冻伤害", "+40.7%")],
+    str(_S._iter_stat_pairs([{"name": "冰冻伤害", "value": "+40.7%"}])),
+)
+check(
+    "⑯④ 形状归一化：字典中文键 {词条缩写,数值} → 一条",
+    _S._iter_stat_pairs([{"词条缩写": "病毒伤害", "数值": "104.3%"}]) == [("病毒伤害", "104.3%")],
+    str(_S._iter_stat_pairs([{"词条缩写": "病毒伤害", "数值": "104.3%"}])),
+)
+check(
+    "⑯⑤ 形状归一化：裸字符串 / 长度≠2 / 空 → 跳过，绝不 *item 解包",
+    _S._iter_stat_pairs(["火"]) == []
+    and _S._iter_stat_pairs(["a", "b", "c"]) == [("a", "b")]
+    and _S._iter_stat_pairs(None) == []
+    and _S._iter_stat_pairs([["a", "b", "c"]]) == [],
+    f"{_S._iter_stat_pairs(['火'])} / {_S._iter_stat_pairs(['a', 'b', 'c'])}",
+)
+check(
+    "⑯⑥ 形状归一化：混入裸字符串不崩、其余条目照收",
+    _S._iter_stat_pairs([["多重射击", "148"], "火", ["伤害", "196.5"]])
+    == [("多重射击", "148"), ("伤害", "196.5")],
+    str(_S._iter_stat_pairs([["多重射击", "148"], "火", ["伤害", "196.5"]])),
+)
+
+# 端到端：线上那两张崩掉的卡，现在必须走通（不再「内部错误」）
+_flat_1645 = {
+    "weapon": "托里德 Sati-croniata",
+    "positive": [["射速", "73.9"], ["多重射击", "111.4"], ["伤害", "196.5"]],
+    "negative": ["变焦", "60.8"],
+}
+_pf, _nf = _norm(_flat_1645, _rev)
+check(
+    "⑯⑦ 线上 10-14 16:45 卡（negative 扁平）：不崩，且负词条 变焦 60.8 收进 negative",
+    _nf == [("zoom", 60.8)] and len(_pf) == 3,
+    f"{_pf} / {_nf}",
+)
+_flat_1708 = {
+    "weapon": "盗贼 Sati-igniata",
+    "positive": [["火焰伤害", "124.2%"], ["多重射击", "166.4%"], ["变焦", "-80.5%"]],
+    "negative": ["伤害", "297.3%"],
+}
+_pf2, _nf2 = _norm(_flat_1708, _rev)
+check(
+    "⑯⑧ 线上 10-14 17:08 卡（negative 扁平 name+值）：不崩，四条词条齐全",
+    [s for s, _ in _pf2] == ["heat_damage", "multishot"]
+    and sorted(s for s, _ in _nf2) == ["melee_damage", "zoom"],
+    f"{_pf2} / {_nf2}",
+)
+_dict_1708 = {
+    "weapon": "奏凯 Feva-gelidex",
+    "positive": [
+        {"name": "冰冻伤害", "value": "+40.7%"},
+        {"name": "装填速度", "value": "+23.9%"},
+        {"name": "触发几率", "value": "+39.8%"},
+    ],
+    "negative": [{"name": "暴击几率", "value": "-55.2%"}],
+}
+_pd, _nd = _norm(_dict_1708, _rev)
+check(
+    "⑯⑨ 线上 10-14 17:08 字典形态卡：不再「语义表 0 正 0 负」（词条全丢）",
+    [s for s, _ in _pd] == ["cold_damage", "reload_speed", "status_chance"]
+    and _nd == [("crit_chance", 55.2)],
+    f"{_pd} / {_nd}",
 )
 
 if FAILED:

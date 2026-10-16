@@ -25,6 +25,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 # ---------------------------------------------------------------------------
@@ -69,7 +70,7 @@ COMMAND_ALIASES: dict[str, set[str]] = {
     # 「声望」：社区黑话 —— 团体声望只能靠刷该地区赏金攒，查声望=查赏金
     #   （2026-10-02 用户要求；裸「声望」= 赏金一览，「金星声望」等见下方预设表）
     "bounty": {"赏金", "声望"},
-    "fissures": {"裂隙"},
+    "fissures": {"裂隙", "裂缝"},  # 裂缝：玩家常用写法（2026-10-16 用户口径，原属开核桃）
     "sortie": {"突击"},
     "archon": {"执刑官", "执刑官猎杀", "大猎杀"},
     "voidtrader": {"奸商", "虚空商人", "巴罗"},
@@ -116,7 +117,7 @@ COMMAND_ALIASES: dict[str, set[str]] = {
     "rank": {"排行", "市场排行"},
     "analysis": {"紫卡分析"},
     "trend": {"趋势", "wm趋势", "价格趋势", "紫卡趋势"},
-    "openrelic": {"开核桃", "裂缝"},
+    "openrelic": {"开核桃", "开裂缝"},
     "xh": {"xh", "玄骸"},
     "relic": {"遗物", "核桃"},
     "parts": {"部件", "零件", "组件"},
@@ -131,6 +132,9 @@ _PRESET_COMMANDS: dict[str, tuple[str, str]] = {
     "钢铁裂隙": ("fissures", "钢铁"),
     "虚空裂隙": ("fissures", "普通"),
     "九重天裂隙": ("fissures", "九重天"),
+    "钢铁裂缝": ("fissures", "钢铁"),
+    "虚空裂缝": ("fissures", "普通"),
+    "九重天裂缝": ("fissures", "九重天"),
     # 赏金/声望的地区预设由下方 _BOUNTY_REGIONS 统一生成
     # （裸地区词 / 「X赏金」/「X声望」三式等价，见 ALIAS_TO_COMMAND 构建处）
     "金垃圾": ("ducats", "金"),
@@ -186,7 +190,9 @@ _BOUNTY_REGIONS: dict[str, str] = {
     "英择谛": "火卫二",
     "隔离库": "火卫二",
     "深矿": "深矿",
-    "抢劫": "深矿",
+    # ★ 2026-10-11：「抢劫」是金星**抢劫（Heist）**奖励池（bounty_pools「抢劫」：陀螺磁抵系统 /
+    #   大气系统…），不是深矿；旧映射成「深矿」⇒ 发「抢劫」看到的是深矿档。
+    "抢劫": "抢劫",
     "扎里曼": "扎里曼",
     "羽化": "扎里曼",
     "虚空天使": "扎里曼",
@@ -318,6 +324,95 @@ def parse(message: str, *, extra_commands: Optional[dict[str, str]] = None) -> P
 # 依据社区通行的紫卡词条表整理，并补充单字缩写。
 # ---------------------------------------------------------------------------
 RIVEN_STAT_ALIASES: dict[str, set[str]] = {
+    # ★ 2026-10-07 Riven Splicer（Update 44，实机 2026-10-07 上线）的 18 个**新词条**：
+    #   官方 Public Export 七家族 tag 并集 36→54 新增的 18 个 tag，与 wiki「Spliced Traits」
+    #   清单一一对应。**必须注册** —— 否则会被静默错绑（实测：病毒伤害→毒素伤害、
+    #   毒气伤害→毒素伤害、爆炸伤害→暴击伤害、弹药效率→弹药上限、弱点暴击→暴击几率）
+    #   或静默丢弃（⇒ 词条数少算、系数错档、区间偏高约 32%）。
+    #   ⚠ 中文名按既有卡面写法推导（「弹药效率」为官方语言表实证），**待一张实卡复核**。
+    # ★ 2026-10-10：RIVEN_STAT_ZH 的卡面短名（O伤/S伤/T伤/弱点伤/处决伤）必须也是别名 ——
+    #   wr 卡上显示什么，玩家就照抄什么；漏了会被并进武器名（「wr 空刃 弱点伤」→ 武器
+    #   「空刃 弱点伤」）。守卫见 tests/test_riven_stat_i18n.py 第 12 段。
+    "gas_damage": ["毒气伤害", "毒气", "Gas Damage"],
+    "corrosive_damage": ["腐蚀伤害", "腐蚀", "Corrosive Damage"],
+    "viral_damage": ["病毒伤害", "病毒", "Viral Damage"],
+    "radiation_damage": ["辐射伤害", "辐射", "Radiation Damage"],
+    "blast_damage": ["爆炸伤害", "爆炸", "Blast Damage"],
+    "magnetic_damage": ["磁力伤害", "磁力", "Magnetic Damage"],
+    "damage_vs_orokin": [
+        "对奥罗金的伤害",
+        "对奥罗金伤害",
+        "对Orokin伤害",
+        "对 Orokin 伤害",
+        "对奥罗金",
+        "对O伤",
+        "O伤",
+        "Orokin Damage",
+    ],
+    "damage_vs_scaldra": [
+        "对炽蛇军的伤害",
+        "对炽蛇军伤害",
+        "对Scaldra伤害",
+        "对 Scaldra 伤害",
+        "对炽蛇军",
+        "对S伤",
+        "S伤",
+        "Scaldra Damage",
+    ],
+    "damage_vs_techrot": [
+        "对科腐者的伤害",
+        "对科腐者伤害",
+        "对Techrot伤害",
+        "对 Techrot 伤害",
+        "对科腐者",
+        "对T伤",
+        "T伤",
+        "Techrot Damage",
+    ],
+    "weakpoint_damage": ["弱点伤害", "弱点", "弱伤", "弱点伤", "Weakpoint Damage"],
+    "weakpoint_crit_chance": [
+        "弱点暴击几率",
+        "弱点暴击率",
+        "命中弱点暴击几率",
+        "弱点暴击",
+        "弱点暴",
+        "弱爆",
+        "Weakpoint Critical Chance",
+    ],
+    "status_damage": [
+        "异常状态伤害",
+        "状态伤害",
+        "异常伤害",
+        "异常状态",
+        "异常伤",
+        "状态伤",
+        "Status Damage",
+    ],
+    "ammo_efficiency": ["弹药效率", "弹效", "Ammo Efficiency"],
+    "reload_holstered": [
+        "收起武器时弹匣每秒自动装填",
+        "收起时装填",
+        "收枪装填",
+        "收枪",
+        "Reload While Holstered",
+    ],
+    "melee_heavy_attack_damage": [
+        "在重击时的近战伤害",
+        "重击伤害",
+        "重击",
+        "重击伤",
+        "Heavy Attack Damage",
+    ],
+    "melee_heavy_attack_charge": [
+        "重击准备速度",
+        "重击蓄力速度",
+        "重击蓄力",
+        "重击准备",
+        "重击速度",
+        "Heavy Attack Charge",
+    ],
+    "melee_parry_angle": ["招架角度", "格挡角度", "招架", "Parry Angle"],
+    "melee_slam_damage": ["震地攻击伤害", "震地伤害", "震地", "震地伤", "Slam Damage"],
     "melee_damage": {"近战伤害", "基伤", "基础伤害", "近战", "基础", "基"},
     "crit_chance": {
         "暴击几率",
@@ -345,10 +440,10 @@ RIVEN_STAT_ALIASES: dict[str, set[str]] = {
     "initial_combo": {"初始连击", "初始连击数", "连击数"},
     "combo_duration": {"连击持续时间", "连击时间"},
     "heavy_attack_efficiency": {"重击效率"},
-    # ★ 2026-10-02 归并（用户拍板）：原 combo_efficiency（「连击效率」）在 WM 32
+    # ★ 2026-10-02 归并（口径统一）：原 combo_efficiency（「连击效率」）在 WM 32
     #   属性与官方基值表里都没有对应行，基值却等于「额外连击数几率」的 58.77 ——
     #   属早期误录的幽灵 sid。按用户决定归并到额外连击数几率，这两个词不再单列。
-    "finisher_damage": {"处决伤害", "处决"},
+    "finisher_damage": {"处决伤害", "处决", "处决伤"},
     "slide_crit": {
         "滑行攻击时暴击率",
         "滑暴",
@@ -458,6 +553,26 @@ RIVEN_STAT_COMBOS: dict[str, list[str]] = {
 }
 # 本插件标准词条 id -> WM v1 拍卖数据里的 url_name（部分为合并名）
 RIVEN_URL_COMPAT: dict[str, str] = {
+    # ★ 2026-10-07：WM `/v2/riven/attributes` 已补上 Splicer 的 18 个新词条（32→50 条，
+    #   zh 名与我方逐字一致）⇒ `wr`（拍卖）侧同步映射，否则新词条会被丢成裸 slug。
+    "gas_damage": "gas",
+    "corrosive_damage": "corrosive",
+    "viral_damage": "viral",
+    "radiation_damage": "radiation",
+    "blast_damage": "blast",
+    "magnetic_damage": "magnetic",
+    "damage_vs_orokin": "damage_to_orokin",
+    "damage_vs_scaldra": "damage_to_scaldra",
+    "damage_vs_techrot": "damage_to_techrot",
+    "weakpoint_damage": "weak_point_damage",
+    "weakpoint_crit_chance": "weak_point_critical_chance",
+    "status_damage": "status_damage",
+    "ammo_efficiency": "ammo_efficiency",
+    "reload_holstered": "magazine_reloaded_s_when_holstered",
+    "melee_heavy_attack_damage": "melee_damage_on_heavy_attack",
+    "melee_heavy_attack_charge": "heavy_attack_wind_up_speed",
+    "melee_parry_angle": "parry_angle",
+    "melee_slam_damage": "slam_attack_damage",
     "damage": "base_damage_/_melee_damage",
     "melee_damage": "base_damage_/_melee_damage",
     "crit_chance": "critical_chance",
@@ -477,6 +592,30 @@ RIVEN_URL_COMPAT: dict[str, str] = {
 }
 # 标准词条 id -> 展示主中文名（拍卖展示用，精选短名）
 RIVEN_STAT_ZH: dict[str, str] = {
+    # ★ 2026-10-07 Riven Splicer（Update 44，实机 2026-10-07 上线）的 18 个**新词条**：
+    #   官方 Public Export 七家族 tag 并集 36→54 新增的 18 个 tag，与 wiki「Spliced Traits」
+    #   清单一一对应。**必须注册** —— 否则会被静默错绑（实测：病毒伤害→毒素伤害、
+    #   毒气伤害→毒素伤害、爆炸伤害→暴击伤害、弹药效率→弹药上限、弱点暴击→暴击几率）
+    #   或静默丢弃（⇒ 词条数少算、系数错档、区间偏高约 32%）。
+    #   ⚠ 中文名按既有卡面写法推导（「弹药效率」为官方语言表实证），**待一张实卡复核**。
+    "gas_damage": "毒气",
+    "corrosive_damage": "腐蚀",
+    "viral_damage": "病毒",
+    "radiation_damage": "辐射",
+    "blast_damage": "爆炸",
+    "magnetic_damage": "磁力",
+    "damage_vs_orokin": "O伤",
+    "damage_vs_scaldra": "S伤",
+    "damage_vs_techrot": "T伤",
+    "weakpoint_damage": "弱点伤",
+    "weakpoint_crit_chance": "弱点暴",
+    "status_damage": "异常伤",
+    "ammo_efficiency": "弹效",
+    "reload_holstered": "收枪装填",
+    "melee_heavy_attack_damage": "重击伤",
+    "melee_heavy_attack_charge": "重击速度",
+    "melee_parry_angle": "招架",
+    "melee_slam_damage": "震地伤",
     "melee_damage": "基伤",
     "crit_chance": "暴击",
     "crit_damage": "暴伤",
@@ -526,6 +665,11 @@ for _std, _aliases in RIVEN_STAT_ALIASES.items():
         _STAT_LOOKUP.setdefault(_a, _std)
 for _combo in RIVEN_STAT_COMBOS:
     _STAT_LOOKUP.setdefault(_combo, _combo)
+# 最长别名长度：分词时片段不必试得比它更长
+_STAT_KEY_MAX = max(map(len, _STAT_LOOKUP))
+# 连写词条串长度上限：紫卡最多 4 条词条，再长不可能是词条串（直接当普通内容词），
+# 也挡住超长 token 让递归分词卡住事件循环 / 递归过深（2026-10-10 实测 4×950 字 3.7 s）
+_SEGMENT_MAX_LEN = 64
 
 
 def segment_stats(blob: str) -> Optional[list[str]]:
@@ -536,6 +680,8 @@ def segment_stats(blob: str) -> Optional[list[str]]:
     n = len(blob)
     if n == 0:
         return []
+    if n > _SEGMENT_MAX_LEN:
+        return None
     memo: dict[int, Optional[list[str]]] = {}
 
     def dp(i: int) -> Optional[list[str]]:
@@ -545,7 +691,7 @@ def segment_stats(blob: str) -> Optional[list[str]]:
             return memo[i]
         best: Optional[list[str]] = None
         # 贪心：先长后短
-        for j in range(n, i, -1):
+        for j in range(min(n, i + _STAT_KEY_MAX), i, -1):
             piece = blob[i:j]
             std = _STAT_LOOKUP.get(piece)
             if std is None:
@@ -731,6 +877,7 @@ class WMQuery:
     item: str = ""  # 物品名（EN 或 CN 别名）
     buy: bool = False  # 收购（查看收购单）
     group_buy: Optional[list[tuple[str, int]]] = None  # 合购 [(item, qty)]
+    group_buy_dropped: int = 0  # 合购超出 GROUP_BUY_MAX 被忽略的项数（回复里提示）
     quantity: Optional[int] = None  # 3个 -> 同时出售 >= 3
     rank: Optional[int] = None  # 零级/满级/3级；满级用 -1 表示
     rank_word: str = ""  # 原始 rank 词（展示用）
@@ -771,6 +918,22 @@ _PART_SPECIFIC = (
     "武器舱",
     "镖袋",
     "护手",
+    # ★ 2026-10-07 扩充（守护/殁世机甲/曲翼/飞船/玄骸锤类）：用户报障
+    #   「wm 玻之武杖p 饰物」出整套 —— 「饰物」不在表里 ⇒ 整串丢给解析 ⇒ 落 set。
+    #   选词口径：WM `/v2/items`（Language: zh-hans）的 component/blueprint
+    #   中文名 843 条按「尾词 + 子串」统计，取**每个覆盖 ≥2 条真实部件名**的词；
+    #   这 8 词在**非部件物品名（3049 条）里 0 撞名**（比 2026-10-05 那批干净，
+    #   不依赖 `_h_wm` 的「原文重组再试」兜底）。
+    #   有意未收录（各只覆盖 1 条，等真实报障再加）：链条/星镖/爪刃/铆钉/锯片/
+    #   散热片/下皮层/弓臂/马达/刀片/剑刃/手套/靴子。
+    "饰物",
+    "引擎",
+    "锤头",
+    "机舱",
+    "圆盘",
+    "机翼",
+    "外甲",
+    "握把",
 )
 _PART_GENERIC = ("蓝图", "总图")
 _PART_ANY = ("配件", "部件")
@@ -843,7 +1006,9 @@ def parse_wm(content: Iterable[str], preset: Optional[str] = None) -> WMQuery:
         elif tok == "合购":
             i += 1
             if i < len(tokens) and ("," in tokens[i] or "*" in tokens[i]):
-                q.group_buy = _parse_group_list(tokens[i])
+                full = _parse_group_list(tokens[i])
+                q.group_buy = full[:GROUP_BUY_MAX]
+                q.group_buy_dropped = len(full) - len(q.group_buy)
             else:
                 item_parts.append(tok)
         elif re.fullmatch(r"(\d+)个", tok):
@@ -865,6 +1030,10 @@ def parse_wm(content: Iterable[str], preset: Optional[str] = None) -> WMQuery:
         i += 1
     q.item = " ".join(item_parts).strip()
     return q
+
+
+# 合购单项数上限：每项一次 WM 订单请求，共享全局限速锁；超出部分忽略并在回复里提示。
+GROUP_BUY_MAX = 10
 
 
 def _parse_group_list(blob: str) -> list[tuple[str, int]]:
@@ -954,6 +1123,11 @@ _CN_TO_MISSION.update(
         "虚空级联": "void cascade",
         "追猎": "pursuit",
         "突袭": "assault",
+        # 九重天风暴任务类型（与 formatters._RAILJACK_TYPE_CN 卡面译名一致；
+        # 「蹲 裂隙 九重天前哨战」靠它命中 skirmish）
+        "前哨战": "skirmish",
+        "爆发": "volatile",
+        "奥影母艇": "orphix",
     }
 )
 
@@ -996,10 +1170,9 @@ TIER_T_ALIAS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # ★ 裂隙筛选的「纯修饰词」（2026-09-26）
 #   这类词**单独出现时不构成条件**，本意是与任务/纪元词**合成一个词元**
-#   （「钢铁防御」= 钢铁之路的防御裂隙）。逗号/空格把它们拆开后会变成
-#   「并列条件取或」（「钢铁,防御」= 钢铁 或 普通防御），语义被放大。
-#   ⚠️ **解析与提示共用这一处** —— `dun_rule_hint()` 靠它判断要不要提示，
-#      别再各写一份清单（「同源两处」是这个项目反复踩的坑）。
+#   （「钢铁防御」= 钢铁之路的防御裂隙）。★ 2026-10-16 用户拍板：「蹲」与「裂隙」查询统一为
+#   **空格 = 且、逗号 = 或**（此前蹲把空格转成逗号 = 或，9-26 只加了提示，10-16 再次踩坑后改语义）。
+#   ⚠️ 别再各写一份清单（「同源两处」是这个项目反复踩的坑）。
 # ---------------------------------------------------------------------------
 FISSURE_HARD_WORDS = ("钢铁", "钢路")
 FISSURE_STORM_WORDS = ("九重天", "empyrean")
@@ -1007,8 +1180,7 @@ FISSURE_NORMAL_WORD = "普通"
 FISSURE_VOID_WORD = "虚空"
 # ★ 2026-10-03：档位词表扩为 古纪/前纪/中纪/后纪 + 安魂 + 全能 + T1–T6。
 #   此前安魂/全能不在表里 ⇒ 退化成节点子串、永不命中（实测坑 2）；T1..T6
-#   同理（坑 1）。FISSURE_MODIFIER_WORDS 是它的派生（dun_rule_hint 自动
-#   跟着走）——**同源一处，别各写一份**。小写 t1..t6 供 p.lower() 匹配。
+#   同理（坑 1）。FISSURE_MODIFIER_WORDS 是它的派生 ——**同源一处，别各写一份**。小写 t1..t6 供 p.lower() 匹配。
 FISSURE_TIER_WORDS = (
     "古纪",
     "前纪",
@@ -1097,12 +1269,10 @@ class FissureFilter:
                 seg.append("九重天")
             if g.get("void"):
                 seg.append("虚空")
-            if (
-                not g.get("hard")
-                and not g.get("storm")
-                and not g.get("void")
-                and (g.get("missions") or g.get("tiers"))
-            ):
+            # ★ 2026-10-11：只有**显式**写了「普通」（hard=False）才写「普通」。旧判据
+            #   「没写钢铁/九重天就补普通」⇒「裂隙 生存」注脚写「普通生存」，而实际条件
+            #   不限难度（钢铁生存也在列表里），注脚与筛选结果对不上。「蹲」共用本函数。
+            if g.get("hard") is False:
                 seg.append("普通")
             if g.get("missions"):
                 seg.append("/".join(MISSION_CN.get(m, m) for m in sorted(g["missions"])))
@@ -1123,14 +1293,31 @@ class FissureFilter:
             if g.get("substr"):
                 seg.append(g["substr"])
             parts.append("".join(seg) or "全部")
-        return "，".join(parts)
+        # ★ 2026-10-16：分组之间是「或」（逗号分组 = 任一命中）。旧写法用「，」连接，读起来像「且」，
+        #   用户看不出自己建的是或订阅（「钢铁,古纪」显示成「钢铁，古纪（T1）」）。
+        return " 或 ".join(parts)
+
+
+# ★ 2026-10-16：筛选串里的「裂隙 / 裂缝」本身是事件名，不是节点名。旧实现把剔除档位词后的
+#   残余当节点子串 ⇒「蹲 钢铁裂隙古纪」残余「裂隙」要求节点名含「裂隙」⇒ 永不命中（静默死订阅，
+#   ZCode 实测）。连写词先归一成档位词（与 _PRESET_COMMANDS 同口径：虚空裂隙 = 普通），
+#   单独的「裂隙 / 裂缝」直接去掉。节点名里带「裂缝」的（如「热美亚裂缝」）剩余部分仍能子串命中。
+_FISSURE_WORD_MAP = {
+    "钢铁裂隙": "钢铁",
+    "钢铁裂缝": "钢铁",
+    "虚空裂隙": "普通",
+    "虚空裂缝": "普通",
+    "九重天裂隙": "九重天",
+    "九重天裂缝": "九重天",
+}
+_FISSURE_WORD_RE = re.compile("|".join([*_FISSURE_WORD_MAP, "裂隙", "裂缝"]))
 
 
 def parse_fissure_filter(text: str) -> FissureFilter:
     """解析 `普通捕获,钢铁虚空生存,九重天拦截` 这类筛选串。"""
     flt = FissureFilter()
     for blob in re.split(r"[,，;；]", text.strip()):
-        blob = blob.strip()
+        blob = _FISSURE_WORD_RE.sub(lambda m: _FISSURE_WORD_MAP.get(m.group(0), ""), blob).strip()
         if not blob:
             continue
         g: dict = {}
@@ -1192,6 +1379,13 @@ def parse_fissure_filter(text: str) -> FissureFilter:
     return flt
 
 
+# 裂隙筛选 0 结果时给出的可用筛选词（「裂隙」查询卡用；与 parse_fissure_filter 的词表一致）
+FISSURE_FILTER_HELP = (
+    "※ 可用筛选词：钢铁 / 九重天 / 普通 / 虚空 ｜ 纪元 古纪…全能（T1–T6）｜"
+    " 任务类型（生存 / 防御 / 中断…）｜ 节点或星球名；空格分开 = 同时满足，逗号分开 = 任一满足"
+)
+
+
 # T1–T6 展示编号顺序（与 formatters._TIER_ORDER 的 Lith=0…Omnia=5 对齐；
 # 本地元组避免 parser ↔ formatters 循环 import —— 两处语义必须一致）。
 _TIER_ORDER_LOCAL = ("Lith", "Meso", "Neo", "Axi", "Requiem", "Omnia")
@@ -1201,7 +1395,7 @@ _TIER_RANGE_TEXT = "T1古纪 / T2前纪 / T3中纪 / T4后纪 / T5安魂 / T6全
 def contains_fissure_tier(text: str) -> bool:
     """文本是否含裂隙档位词（T1–T6 别名 / 古纪…全能）。
 
-    ★ 2026-10-03（用户拍板）：**档位词本身就含裂隙语义** —— 「蹲」用它在
+    ★ 2026-10-03（口径）：**档位词本身就含裂隙语义** —— 「蹲」用它在
     用户漏写类型词时自动判定为裂隙（「蹲 钢铁t5歼灭」直接生效）。
     ⚠ 只认**档位词**（裂隙专属词汇）；钢铁/虚空/地点词一律不推断 ——
     不重蹈 2026-09-14「地点词被静默当裂隙筛选」的覆辙。
@@ -1215,7 +1409,7 @@ def fissure_tier_hint(text_or_parts) -> str:
 
     合法：T1–T6（大小写与全角均可，与中文档位词等价）。以下一律**明确提示**
     （铁律 A：不静默）：T0 / T7 / T9、T05、t55、T5x、5T、孤立的 t。
-    与 :func:`dun_rule_hint` 同风格 —— **只提示、不改解析语义**。
+    **只提示、不改解析语义**。
     """
     if isinstance(text_or_parts, str):
         parts = [text_or_parts]
@@ -1236,32 +1430,6 @@ def fissure_tier_hint(text_or_parts) -> str:
     if not bad:
         return ""
     return f"※ 裂隙档位只支持 T1–T6（{_TIER_RANGE_TEXT}）"
-
-
-def dun_rule_hint(parts: list[str]) -> str:
-    """「蹲」筛选串的**空格陷阱**提示；无需提示时返回空串。
-
-    多词元 = 多个并列条件（`FissureFilter.match` 里 groups 之间是 `any()`/OR），
-    而「钢铁 / 九重天 / 普通 / 虚空 / 古纪…」这类**纯修饰词**本意是与任务词
-    合成**一个**条件（见 :data:`FISSURE_MODIFIER_WORDS`）。拆开写会把语义放大：
-    「钢铁 防御」落库成 `钢铁,防御` = 钢铁 **或** 普通防御。
-
-    只在「≥2 个词元且至少一个是纯修饰词」时提示 —— 纯任务词并列
-    （「捕获 生存」= 两种任务取或）是正常写法，不提示。
-    **只提示、不改语义**：订阅仍按用户原样落库。
-    """
-    parts = [p for p in parts if p and p.strip()]
-    if len(parts) < 2:
-        return ""
-    if not any(any(w in p.lower() for w in FISSURE_MODIFIER_WORDS) for p in parts):
-        return ""
-    return (
-        "※ 提示：多词=多条件取或；要合并请连写「"
-        + "".join(parts)
-        + '」或加引号「"'
-        + " ".join(parts)
-        + '"」'
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1309,56 +1477,115 @@ def parse_duration(text: str) -> Optional[int]:
     return None
 
 
+# 推送时间窗一律按**北京时间**（UTC+8）判定，与服务器时区无关（2026-10-11 立）。
+try:  # 优先 IANA 名；容器缺 tzdata 时退回固定 UTC+8（中国无夏令时，二者等价）
+    from zoneinfo import ZoneInfo as _ZoneInfo
+
+    BEIJING_TZ = _ZoneInfo("Asia/Shanghai")
+except Exception:  # noqa: BLE001 - 无 tzdata
+    BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def beijing_now() -> datetime:
+    """当前北京时间（带 tzinfo）。"""
+    return datetime.now(BEIJING_TZ)
+
+
 @dataclass
 class TimeWindow:
-    """免打扰/允许推送时间窗。空对象表示全天允许。"""
+    """允许推送的时间窗（北京时间）。空对象表示全天允许。
 
-    start: Optional[int] = None  # 小时 0-23
-    end: Optional[int] = None  # 小时 0-23
-    days: Optional[set[int]] = None  # 星期集合（1=周一 ... 7=周日）
-    at_hour: Optional[int] = None  # 每天 HH 点推送
+    口径（2026-10-11 用户拍板）：
+    · ``start``~``end`` 为小时，**结束小时是开区间**：「22到8」= 22:00 到次日 8:00（8 点整结束）；
+      「8到22」= 8:00–21:59；「0到24」= 全天（解析时直接归一成空窗）；
+      ``start == end``（如「周1 23点」存成 23/23）= 只那一个整点小时。
+    · ``days`` 的星期按**窗口起始那天**算：「周五 22到8」含周六凌晨 0–8 点。
+    · ``at_hour``（每天 HH 点）= 该整点小时内（HH:00–HH:59）。
+    """
+
+    start: Optional[int] = None  # 起始小时 0-23
+    end: Optional[int] = None  # 结束小时 0-24（开区间）
+    days: Optional[set[int]] = None  # 星期集合（1=周一 ... 7=周日），按窗口起始日
+    at_hour: Optional[int] = None  # 每天 HH 点（整个小时）
 
     @property
     def is_always(self) -> bool:
         return self.start is None and self.days is None and self.at_hour is None
 
     def allows(self, now) -> bool:
-        """now: datetime（本地时区）。"""
-        if self.days is not None and now.isoweekday() not in self.days:
-            return False
-        if self.at_hour is not None:
-            return now.hour == self.at_hour and now.minute < 30
-        if self.start is None:
-            return True
+        """now: datetime（北京时间；调用方负责换算）。"""
         h = now.hour
-        if self.start <= self.end:
-            return self.start <= h <= self.end
-        return h >= self.start or h <= self.end  # 跨零点，如 22到8
+        wd = now.isoweekday()
+        if self.at_hour is not None:
+            return h == self.at_hour and (self.days is None or wd in self.days)
+        if self.start is None:
+            return self.days is None or wd in self.days
+        end = self.end if self.end is not None else self.start
+        if end == self.start:  # 单个整点小时
+            return h == self.start and (self.days is None or wd in self.days)
+        if self.start < end:  # 不跨午夜
+            ok = self.start <= h < end
+            start_wd = wd
+        else:  # 跨午夜，如 22到8
+            ok = h >= self.start or h < end
+            # 凌晨段属于「前一天开始」的窗口
+            start_wd = wd if h >= self.start else (wd - 2) % 7 + 1
+        return ok and (self.days is None or start_wd in self.days)
 
     def describe(self) -> str:
         bits = []
         if self.start is not None:
-            bits.append(f"{self.start}:00-{self.end}:00")
+            end = self.end if self.end is not None else self.start
+            if end == self.start:
+                bits.append(f"{self.start}:00-{self.start + 1}:00")
+            elif end < self.start:
+                bits.append(f"{self.start}:00-次日{end}:00")
+            else:
+                bits.append(f"{self.start}:00-{end}:00")
         if self.days:
             bits.append("周" + "/".join(map(str, sorted(self.days))))
         if self.at_hour is not None:
-            bits.append(f"每天{self.at_hour}点")
+            bits.append(f"每天{self.at_hour}点（{self.at_hour}:00-{self.at_hour}:59）")
         return " ".join(bits) or "全天"
 
 
 def parse_time_window(text: str) -> Optional[TimeWindow]:
-    """解析 `0到24`、`22到8`、`每天19点`、`周1/3/5 23点`。"""
+    """解析 `0到24`、`22到8`、`每天19点`、`周1/3/5 23点`、`周5 22到8`（北京时间）。"""
     t = text.strip().replace("：", ":")
     if not t:
         return None
     m = re.fullmatch(r"周([1-7](?:[/，][1-7])*)\s*(\d{1,2})点?", t)
     if m:
         days = {int(x) for x in re.split(r"[/，]", m.group(1))}
-        return TimeWindow(days=days, start=int(m.group(2)), end=int(m.group(2)))
+        hh = int(m.group(2))
+        if hh > 23:
+            return None
+        return TimeWindow(days=days, start=hh, end=hh)
+    m = re.fullmatch(r"周([1-7](?:[/，][1-7])*)\s*(\d{1,2})到(\d{1,2})(?:点)?", t)
+    if m:
+        days = {int(x) for x in re.split(r"[/，]", m.group(1))}
+        w = _range_window(int(m.group(2)), int(m.group(3)))
+        if w is None:
+            return None
+        if w.is_always:  # 「周5 0到24」= 周五全天
+            return TimeWindow(days=days, start=0, end=24)
+        w.days = days
+        return w
     m = re.fullmatch(r"每天\s*(\d{1,2})点?", t)
     if m:
-        return TimeWindow(at_hour=int(m.group(1)))
+        hh = int(m.group(1))
+        return TimeWindow(at_hour=hh) if hh <= 23 else None
     m = re.fullmatch(r"(\d{1,2})到(\d{1,2})(?:点)?", t)
     if m:
-        return TimeWindow(start=int(m.group(1)) % 24, end=int(m.group(2)) % 24)
+        return _range_window(int(m.group(1)), int(m.group(2)))
     return None
+
+
+def _range_window(a: int, b: int) -> Optional[TimeWindow]:
+    """「a到b」→ 窗口；0到24 / 24到0 归一成全天（空窗）；越界返回 None。"""
+    if a > 24 or b > 24:
+        return None
+    a = a % 24  # 24 点即次日 0 点
+    if a == 0 and b in (0, 24):
+        return TimeWindow()  # 0到24 = 全天（0到0 视同：旧版把 0到24 存成 0/0，口径统一）
+    return TimeWindow(start=a, end=b)

@@ -15,12 +15,19 @@
 
 断言对「今天是哪天」不敏感：批次下标按 epoch + anchor_idx 在测试里独立重算，
 再和卡面文字对齐，避免把某一天的快照写死。
+
+★ 2026-10-15：本脚本只做**逻辑回归**，全程走固定时钟（种子卡面按种子自身的快照时刻求值，
+换批边界/跨周期/过期快照用临时 fixture 覆盖）。「随包快照此刻是否还新鲜」属于数据新鲜度，
+已移到 ``python scripts/run_checks.py health``（判据同运行期 ``valence_is_stale``），
+不再让本脚本随日期自然变红。
 """
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import re
+import shutil
 import sys
 import tempfile
 import types
@@ -119,8 +126,28 @@ _install_astrbot_stub()
 
 import main as plugin  # noqa: E402
 from core import calculators as calc  # noqa: E402
+from core import formatters as fmt  # noqa: E402
+from core import paths as core_paths  # noqa: E402
 
 ROT = json.loads((ROOT / "core" / "data" / "rotations.json").read_text(encoding="utf-8"))
+
+# —— 固定时钟（2026-10-15 加）——
+# 运行期在函数内 ``from datetime import datetime`` 后取 ``datetime.now``，倒计时走
+# ``formatters._now``；这里把两处都换成可设的时钟，运行期代码不动。
+_REAL_DT = _dt.datetime
+_CLOCK: list = [None]
+
+
+class _FrozenDT(_REAL_DT):
+    @classmethod
+    def now(cls, tz=None):
+        if _CLOCK[0] is None:
+            return _REAL_DT.now(tz)
+        return _CLOCK[0].astimezone(tz) if tz else _CLOCK[0]
+
+
+_dt.datetime = _FrozenDT
+fmt._now = lambda: _FrozenDT.now(timezone.utc)
 
 FAILED: list[str] = []
 
@@ -186,6 +213,13 @@ check(
     str([x.get("cn") for b in _batches for x in b if not (x.get("cn") or "").startswith("终幕·")]),
 )
 
+# 种子卡面按种子自身的快照时刻求值（确定性；快照缺失/畸形时退回终幕 epoch）
+try:
+    _SEED_AT = datetime.fromisoformat(coda["valence_snapshot"])
+except (KeyError, TypeError, ValueError):
+    _SEED_AT = datetime.fromisoformat(coda["epoch"])
+_CLOCK[0] = _SEED_AT
+
 
 # ------------------------------------------------------------- 卡面（信条）
 title, lines = (
@@ -217,13 +251,14 @@ check("终幕卡标题", reply.title == "Coda 终幕武器轮换", reply.title)
 # 独立重算当前批次下标，再和卡面对齐（不写死某一天）
 _epoch = datetime.fromisoformat(coda["epoch"])
 _period = timedelta(hours=int(coda["period_hours"]))
-_now = datetime.now(timezone.utc)
+_now = _SEED_AT
 _passed = int((_now - _epoch) // _period)
 _idx = (int(coda["anchor_idx"]) + _passed) % len(_batches)
 _labels = coda["batch_label"]
 check(
     f"终幕卡标注当前批次（{_labels[_idx]} 批）",
-    any(f"当前为 {_labels[_idx]} 批" in ln for ln in lines),
+    # ★ 2026-10-11 第二步改版：「◆ 当前为 B 批（…）」改为 KV「◆ 当前批次：B 批｜共 2 批轮换…」，语义不变
+    any(ln.startswith("◆ 当前批次：") and f"{_labels[_idx]} 批" in ln for ln in lines),
     str(lines[:1]),
 )
 check("终幕卡列出当前批 7 把", sum(1 for ln in lines if ln.startswith("· 终幕·")) == 7, str(lines))
@@ -351,17 +386,8 @@ for _k, _d in (("tenet", tenet), ("coda", coda)):
     except (TypeError, ValueError):
         _snap, _ok = None, False
     check(f"{_k} 快照时间可解析", _ok, str(_raw))
-    if _snap:
-        if _snap.tzinfo is None:
-            _snap = _snap.replace(tzinfo=timezone.utc)
-        _ep = datetime.fromisoformat(_d["epoch"])
-        _pd = timedelta(hours=int(_d["period_hours"]))
-        _win_start = _ep + _pd * int((datetime.now(timezone.utc) - _ep) // _pd)
-        check(
-            f"{_k} 快照落在当前轮次内（未过期）",
-            _snap >= _win_start,
-            f"snapshot={_snap.isoformat()} window={_win_start.isoformat()}",
-        )
+# 「快照落在此刻的轮次内（未过期）」是数据新鲜度，不是逻辑回归 ⇒ 见
+# scripts/run_checks.py health；过期判定的边界逻辑由文末固定时钟 fixture 覆盖。
 
 # —— 卡面：每条武器行都带「元素 百分比」，并有一行快照说明 ——
 _reply_t = OBJ._rotation_lines("tenet", "Ergo 信条武器轮换")
@@ -382,30 +408,39 @@ for _name, _rep, _n in (("信条", _reply_t, 5), ("终幕", _reply_c, 7)):
     check(f"{_name} 卡有快照说明行", any("快照" in ln for ln in _rep.lines), str(_rep.lines[-3:]))
 
 # 具体值抽查（对照 wiki 快照，发版链第 0 步刷新后同步）
-# ★ 2026-10-03 刷新（窗口 10-02 00:00 UTC 起，信条本轮换批）：**5 把全部重掷** ——
-#   Ferrox Impact 25.2→Radiation 25.7、Exec Heat 25.8→Toxin 38.8、
-#   Agendus Impact 56.4→Heat 47.2、Grigori Electricity 38.6→60.0、Livia Radiation 30.6→Electricity 28.1。
-#   （本轮起刷新源改为源页 wikitext，见 scripts/fetch_valence.py 头注。）
+# ★ 2026-10-07 刷新（窗口 10-06/10-07 00:00 UTC 起，信条与终幕本轮都重掷）：
+#   刷新源 = Tenet_Weapons / Coda_Weapons **源页 wikitext**（?action=raw，经服务器
+#   FlareSolverr 抓取；口径见 scripts/fetch_valence.py 头注）。信条 5 把全部重掷 ——
+#   Agendus Heat 47.2→Impact 39.2、Exec Toxin 38.8→Cold 39.8、Ferrox Radiation
+#   25.7→Magnetic 36.8、Grigori Electricity 60.0→Heat 25.5、Livia Electricity
+#   28.1→Toxin 25.1（上一轮 10-03 的值可在 git 历史里对）。
+# ★ 2026-10-15 刷新（窗口 10-15 00:00 UTC 起，信条与终幕 A 批本轮都重掷）：刷新源 =
+#   Coda_Weapons / Tenet_Weapons **源页 wikitext**（经服务器 FlareSolverr，见
+#   scripts/fetch_valence.py）。本窗口抽查的两把：Ferrox Electricity 27.7→Cold 57.0、
+#   Exec Toxin 25.1→Magnetic 29.8。
 _tmap = {i["en"]: (i.get("element"), i.get("bonus")) for i in _tenet_items}
 check(
-    "信条·铁晶磁轨炮 = 辐射 25.7%（wiki 2026-10-03 快照）",
-    _tmap.get("Tenet Ferrox") == ("Radiation", 25.7),
+    "信条·铁晶磁轨炮 = 冰冻 57.0%（wiki 2026-10-15 源页）",
+    _tmap.get("Tenet Ferrox") == ("Cold", 57.0),
     str(_tmap.get("Tenet Ferrox")),
 )
 check(
-    "信条·枢密 = 毒素 38.8%（wiki 2026-10-03 快照）",
-    _tmap.get("Tenet Exec") == ("Toxin", 38.8),
+    "信条·枢密 = 磁力 29.8%（wiki 2026-10-15 源页）",
+    _tmap.get("Tenet Exec") == ("Magnetic", 29.8),
     str(_tmap.get("Tenet Exec")),
 )
 _cmap = {i["en"]: (i.get("element"), i.get("bonus")) for i in _cur_batch}
-# 终幕按批次抽查：★ 每次终幕换批后，本表的当前批抽查值必须同步（两批的值都随换批
-#   重掷，逐条取自刷新后的 core/data/rotations.json）。
-#   2026-10-03 刷新回写：coda 换批到 B —— B 批 7 条首次全量落表（Bassocyst Magnetic
-#   31.6 / Synapse Toxin 25.6 …，与钉值一致）；此前「非当前批拿不到真值」的限制已随
-#   刷新源改源页 wikitext 解除（源页 A/B 两表全量公布 ⇒ 两批都填）。
+# 终幕按批次抽查：★ 每次终幕换批后，本表的当前批抽查值必须同步（A/B 两批的值都随
+#   换批重掷，逐条取自刷新后的 core/data/rotations.json；刷新源 = 源页 wikitext）。
+#   批次归属由 ``(anchor_idx + 换轮次数) % 2`` 计算 —— anchor_idx 是**相位基准**，
+#   不等于当前批下标；epoch 2026-09-13、anchor_idx=0 ⇒ 该日起第 1 个 4 天窗口为 A 批。
+#   终幕换批边界比信条晚 24h，**不要**为了整齐去对齐 epoch（对齐会整体错位一天）。
+# ★ 2026-10-15 刷新（快照 10-15T11:59，源页 wikitext）：A 批（当前生效）7 条全重掷 ——
+#   Catabolyst Impact 37.9→Toxin 33.2、Motovore Electricity 56.3→Magnetic 25.7；
+#   B 批本轮未动（Bassocyst Radiation 38.3 / Synapse Heat 54.9 保持）。
 _SPOT = {
-    "A": {"Coda Catabolyst": ("Heat", 48.9), "Coda Motovore": ("Impact", 25.0)},
-    "B": {"Coda Bassocyst": ("Magnetic", 31.6), "Coda Synapse": ("Toxin", 25.6)},
+    "A": {"Coda Catabolyst": ("Toxin", 33.2), "Coda Motovore": ("Magnetic", 25.7)},
+    "B": {"Coda Bassocyst": ("Radiation", 38.3), "Coda Synapse": ("Heat", 54.9)},
 }
 _cur_label = (coda.get("batch_label") or ["A", "B"])[_idx]
 for _en, _exp in _SPOT.get(_cur_label, {}).items():
@@ -520,6 +555,126 @@ check(
     == {"coda": {}, "tenet": []},
     "空表被误收",
 )
+
+
+# ---------------------------------------------------------------------------
+# ★ 2026-10-15 新增：固定时钟 + 临时 fixture 的换批边界回归
+#   不读真实 core/data 的时间字段（epoch/锚点/快照可能随刷新变），预期值按日历手算。
+#   fixture 写进临时运行目录（core_paths.set_run_dir），read_path 运行目录优先。
+# ---------------------------------------------------------------------------
+def _fx_items(prefix: str, cn: str, n: int) -> list[dict]:
+    return [
+        {"en": f"{prefix} {i}", "cn": f"{cn}{i}", "element": "Heat", "bonus": 30.0}
+        for i in range(n)
+    ]
+
+
+_FX_CODA = {
+    "mode": "batch_cycle",
+    "epoch": "2026-09-13T00:00:00+00:00",
+    "period_hours": 96,
+    "anchor_idx": 0,
+    "batch_label": ["A", "B"],
+    "batches": [_fx_items("Coda A", "终幕·甲", 7), _fx_items("Coda B", "终幕·乙", 7)],
+    "valence_snapshot": "2026-09-21T06:00:00+00:00",
+}
+_FX_TENET = {
+    "mode": "refresh_only",
+    "epoch": "2026-09-12T00:00:00+00:00",
+    "period_hours": 96,
+    "items": _fx_items("Tenet X", "信条·丙", 5),
+    "valence_snapshot": "2026-09-20T06:00:00+00:00",
+}
+_FX_INC = {
+    "epoch": "2026-06-22T00:00:00+00:00",
+    "anchor_week": 1,
+    "period_hours": 168,
+    "weeks": [
+        [{"en": "W1", "cn": "周一号"}],
+        [{"en": "W2", "cn": "周二号"}],
+        [{"en": "W3", "cn": "周三号"}],
+    ],
+}
+
+
+def _card_at(key: str, fixture: dict, when: str) -> list[str]:
+    d = Path(tempfile.mkdtemp())
+    (d / "rotations.json").write_text(json.dumps({key: fixture}, ensure_ascii=False), "utf-8")
+    prev = core_paths._RUN
+    core_paths.set_run_dir(d)
+    _CLOCK[0] = datetime.fromisoformat(when)
+    try:
+        return OBJ._rotation_lines(key, "T").lines
+    finally:
+        core_paths.set_run_dir(prev)
+        _CLOCK[0] = _SEED_AT
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# 终幕：(时刻, 当前批, 下一批, 换批倒计时行) —— epoch 09-13 起 A 批，每 4 天交替
+for _when, _cur, _nxt, _cd in (
+    ("2026-09-16T23:59:59+00:00", "A", "B", "◆ 距换批：剩余 不到1分钟（09-17 00:00 UTC）"),
+    ("2026-09-17T00:00:00+00:00", "B", "A", "◆ 距换批：剩余 4天0小时（09-21 00:00 UTC）"),
+    ("2026-09-17T00:00:01+00:00", "B", "A", "◆ 距换批：剩余 3天23小时（09-21 00:00 UTC）"),
+    # epoch 之前：上一轮（09-09～09-13）是 B 批
+    ("2026-09-12T12:00:00+00:00", "B", "A", "◆ 距换批：剩余 12小时0分（09-13 00:00 UTC）"),
+    # 跨周期：09-13 → 2027-01-01 12:00 = 110.5 天 = 27 个整周期（奇数 ⇒ B），窗口 12-30 起
+    ("2027-01-01T12:00:00+00:00", "B", "A", "◆ 距换批：剩余 1天12小时（01-03 00:00 UTC）"),
+    ("2027-01-03T00:00:00+00:00", "A", "B", "◆ 距换批：剩余 4天0小时（01-07 00:00 UTC）"),
+):
+    _ls = _card_at("coda", _FX_CODA, _when)
+    _cn = "终幕·甲" if _cur == "A" else "终幕·乙"
+    check(
+        f"[固定时钟] 终幕 {_when[:19]} ⇒ {_cur} 批、下一批 {_nxt}",
+        any(ln.startswith("◆ 当前批次：") and f"{_cur} 批" in ln for ln in _ls)
+        and any(ln.startswith(f"◆ 下一批 {_nxt}") for ln in _ls)
+        and sum(1 for ln in _ls if ln.startswith(f"· {_cn}")) == 7,
+        str(_ls[:3]),
+    )
+    check(f"[固定时钟] 终幕 {_when[:19]} 倒计时", _cd in _ls, str(_ls[:3]))
+
+# 信条：元素加成每 4 天（epoch 09-12）重生成
+for _when, _cd in (
+    ("2026-09-15T23:00:00+00:00", "剩余 1小时0分（09-16 00:00 UTC，每 4 天一次）"),
+    ("2026-09-16T00:00:00+00:00", "剩余 4天0小时（09-20 00:00 UTC，每 4 天一次）"),
+):
+    _ls = _card_at("tenet", _FX_TENET, _when)
+    check(
+        f"[固定时钟] 信条 {_when[:19]} 重生成倒计时",
+        any(ln.startswith("◆ 距元素加成重生成：") and _cd in ln for ln in _ls),
+        str(_ls[:1]),
+    )
+
+# 灵化：3 周循环，周一 00:00 UTC 换轮（epoch 06-22 为第 1 周）
+for _when, _wk in (
+    ("2026-06-28T23:59:59+00:00", "第 1/3 周"),
+    ("2026-06-29T00:00:00+00:00", "第 2/3 周"),
+    ("2026-07-13T00:00:00+00:00", "第 1/3 周"),  # 三周后回绕
+):
+    _ls = _card_at("incarnon", _FX_INC, _when)
+    check(f"[固定时钟] 灵化 {_when[:19]} ⇒ {_wk}", _ls[0].startswith(f"◆ 本周：{_wk}"), _ls[0])
+
+# 快照说明行：本轮 / 上一轮（过期）/ 缺失三态（快照 09-21 06:00，窗口 09-21～09-25）
+for _key, _fx, _when, _want in (
+    ("coda", _FX_CODA, "2026-09-24T23:59:59+00:00", "（本轮快照）"),
+    ("coda", _FX_CODA, "2026-09-25T00:00:00+00:00", "（上一轮快照，数值可能已变）"),
+    ("tenet", _FX_TENET, "2026-09-21T00:00:00+00:00", "（本轮快照）"),
+    ("tenet", _FX_TENET, "2026-09-24T00:00:00+00:00", "（上一轮快照，数值可能已变）"),
+):
+    _ls = _card_at(_key, _fx, _when)
+    check(
+        f"[固定时钟] {_key} {_when[:19]} 快照标注 {_want}",
+        any(ln.startswith("※ 元素与加成为") and _want in ln for ln in _ls),
+        str([ln for ln in _ls if "快照" in ln]),
+    )
+_ls = _card_at(
+    "coda",
+    {k: v for k, v in _FX_CODA.items() if k != "valence_snapshot"},
+    "2026-09-22T00:00:00+00:00",
+)
+check("[固定时钟] 缺快照 ⇒ 不印快照说明行", not any("快照" in ln for ln in _ls), str(_ls))
+
+_dt.datetime = _REAL_DT
 
 print()
 if FAILED:

@@ -10,18 +10,60 @@
 
 from __future__ import annotations
 
+import collections
 import difflib
 import json
 import re
 from typing import Optional
 
 from .. import api_client
+from ..logging_compat import logger
 from .. import formatters as fmt
 from .. import matching
-from ..parser import parse_wm, parse_wr
-from .base import PLUGIN_DIR, Reply
+from ..parser import GROUP_BUY_MAX, parse_wm, parse_wr
+from .base import PLUGIN_DIR, Reply, err_card
 
 JUNK_FILE = PLUGIN_DIR / "core" / "data" / "junk.json"
+
+# 「蓝图=总图」分支的**排除词**（`_pick_wm_set_part` 用）：
+#   「机体蓝图」这类**部件蓝图**不能被当成武器总图挑走。
+# ★★ 必须与 `core/parser.py::_PART_SPECIFIC` **同步**（差集只允许「头部神经」——
+#   它在 parser 侧已被 `_PART_STRENGTH` 归并成「头部」）。2026-10-07 提到模块级，
+#   让 tests/test_wm_part.py 能做**结构断言**（此前只有注释提醒，靠人记）。
+_SET_BLUEPRINT_SKIP = (
+    "机体",
+    "头部",
+    "系统",
+    "枪管",
+    "枪机",
+    "枪托",
+    "头盔",
+    "握柄",
+    "刀刃",
+    "连接器",
+    "外壳",
+    "弓弦",
+    "弓身",
+    "上弓臂",
+    "下弓臂",
+    "拳套",
+    "武器舱",
+    "镖袋",
+    "护手",
+    # ★ 2026-10-07 再同步 8 个新词（饰物/引擎/锤头/机舱/圆盘/机翼/外甲/握把）。
+    #   全量 234 套装实测：不同步的话「蓝图」分支有 7 套给错部件
+    #   （遂心=握把蓝图、Mantis/Scimitar/Xiphos/星察/午夜电波=引擎蓝图、
+    #   刺影=外甲蓝图）；同步后 1 套修真 bug、5 套改给机身蓝图、1 套（刺影）
+    #   变成「明说没有蓝图」——不静默给错。
+    "饰物",
+    "引擎",
+    "锤头",
+    "机舱",
+    "圆盘",
+    "机翼",
+    "外甲",
+    "握把",
+)
 
 
 # 「头」部件黑话消歧（2026-10-02 二修）：「水晶头」「水晶p头」「水晶 头」…
@@ -49,30 +91,99 @@ async def _head_part_resolve(client, item: str):
 
 
 async def riven_market_weapon(client, query: str, weapon: dict) -> dict:
-    """紫卡**市场**（wr）按母武器认卡 —— 2026-10-05 用户口径。
+    """紫卡**市场**（wr）按**家族主武器**认卡 —— 2026-10-05 / 2026-10-10 用户口径。
 
-    「wr 绝路」→ 绝路家族（含 Prime）的紫卡都归它；市场路径**不解析倾向**，
-    只要认出是哪把武器。WM 拍卖端点只认**自家列表**里的 slug（实测
-    `weapon_url_name=rubico_prime` → **HTTP 400**，`rubico` → 200），而解析可能
-    先命中本地补全的变体条目（`dispositions_rivenmirror.json` 的 rubico_prime 等）
-    ⇒ 命中 slug 不在自家列表时，剥 Prime 后缀（p / p版 / Prime，含条目 zh 名）
-    回退母武器再解析一次；回退不到就原样返回（交给下游报空，不静默换武器）。
+    紫卡在家族内通用，挂单按主武器挂 ⇒ 「wr Dex侍刃 / 侍刃p / 棱晶空刃」一律查
+    家族主武器（nikana / skana）的挂单；市场路径**不解析倾向**，只要认出是哪把武器。
+    WM 拍卖端点只认**自家列表**里的 slug（实测 `weapon_url_name=rubico_prime` →
+    **HTTP 400**，`rubico` → 200；`prisma_skana` → 400 item_not_exist）。
 
-    注：WM 自家列表里本就以 `_prime` 为名的独立武器（euphona_prime 等，其母武器
-    不在表内）**不受影响** —— 它们本来就在自家列表里（第一道判断即放行）。
+    解析顺序（家族判据只认 DE 官方 parentName 谱系 `riven_families.json`，经
+    `matching.family_key`；名字不参与判族）：
+      ① 家族主武器在自家列表 ⇒ 用它（`_riven_family_root`）——
+         Dex侍刃 → nikana（2026-10-10 用户口径：WM 虽另列 dex_nikana，也查主武器）；
+      ② 武器本身就在自家列表 ⇒ 原样（Dex Dakra 自成一族、euphona_prime 等独立条目）；
+      ③ 剥 Prime 后缀（p / p版 / Prime，含条目 zh 名）回退母武器再解析一次；
+      ④ 同族的自家列表成员（`_riven_family_listed`，主武器未上 WM 时）；
+      都认不出唯一一把就原样返回（交给下游报空，不静默换武器）。
     """
     if not weapon:
         return weapon
     own = await client.wm_riven_weapon_slugs()
+    entries = await client.wm_riven_weapons()
+    root = _riven_family_root(weapon, entries, own)
+    if root:
+        return root
     if weapon.get("url_name") in own:
         return weapon
     base_q = matching.prime_base(query) or matching.prime_base(weapon.get("zh") or "")
-    if not base_q:
-        return weapon
-    base_w = await client.resolve_riven_weapon(base_q)
-    if base_w and base_w.get("url_name") in own:
-        return base_w
-    return weapon
+    if base_q:
+        base_w = await client.resolve_riven_weapon(base_q)
+        if base_w and base_w.get("url_name") in own:
+            return base_w
+    return _riven_family_listed(weapon, entries, own) or weapon
+
+
+def _same_family_listed(weapon: dict, entries: list, own: set) -> tuple[str, list]:
+    """(家族根, 同族且在 WM 自家列表里的条目)；同 url_name 只留一条。
+
+    紫卡类别（riven_type）已知时先收窄：Vinquibus 枪 / 近战两形态同族却是两种紫卡，
+    近战形态不得落到步枪主武器；收窄后为空才退回不收窄（与第一版同口径）。
+    """
+    key = matching.family_key(weapon.get("en") or "")
+    if not key:
+        return "", []
+    seen: set = set()
+    cands = []
+    for e in entries:
+        u = e.get("url_name")
+        if u in own and u not in seen and matching.family_key(e.get("en") or "") == key:
+            seen.add(u)
+            cands.append(e)
+    rtype = weapon.get("riven_type") or ""
+    if rtype and len(cands) > 1:
+        cands = [e for e in cands if e.get("riven_type") == rtype] or cands
+    return key, cands
+
+
+def _riven_family_root(weapon: dict, entries: list, own: set) -> Optional[dict]:
+    """家族**主武器**（谱系根）在 WM 自家列表里的条目；认不出 ⇒ None。
+
+    ★ 2026-10-10 用户口径：wr 只查家族主武器（Dex侍刃 → nikana，不查 dex_nikana）。
+    根 = `riven_families.json` 的家族根键（ExportWeapons uniqueName 尾段，如 Katana）：
+      · WM 条目的 `game_ref`（= DE uniqueName）尾段 == 根键 ⇒ 主武器（nikana 的
+        `.../KatanaAndWakizashi/Katana`）；
+      · 人工补丁族（Hek / DarkDagger，根键取自基础武器名）：英文名归一化 == 根键
+        （Hek 的 uniqueName 是 QuadShotgun，只能这样认）；
+      · 都没有 ⇒ None（交给后续回退，不猜）。
+    不跨族：Dex Furis 的根是 AkimboAutoPistols（Afuris），Dex Dakra 自成 DexTheSecond。
+    """
+    key, cands = _same_family_listed(weapon, entries, own)
+    if not cands:
+        return None
+    hit = [e for e in cands if (e.get("game_ref") or "").rsplit("/", 1)[-1] == key]
+    if not hit:
+        nk = matching.normalize(key)
+        hit = [e for e in cands if matching.normalize(e.get("en") or "") == nk]
+    return hit[0] if len(hit) == 1 else None
+
+
+def _riven_family_listed(weapon: dict, entries: list, own: set) -> Optional[dict]:
+    """主武器不在 WM 列表时的回退：同族里 **WM 自家列表**的成员（2026-10-10 第一版）。
+
+    ★ 对照 wfsim ce78ffeafd：紫卡按家族通用，WM 拍卖只认家族里它自家列出的条目
+    （实测 `weapon_url_name=prisma_skana` → **HTTP 400** item_not_exist）。
+    候选 = 同族且在自家列表里的条目（`_same_family_listed`，已按紫卡类别收窄）：
+      · 只有一个 ⇒ 就是它；
+      · 多个 ⇒ 取**名字就是家族名**的那个（候选英文名被查询英文名包含，且唯一）；
+      · 认不出唯一一个 ⇒ None（不猜）。
+    """
+    _key, cands = _same_family_listed(weapon, entries, own)
+    if len(cands) == 1:
+        return cands[0]
+    qn = matching.normalize(weapon.get("en") or "")
+    named = [e for e in cands if (n := matching.normalize(e.get("en") or "")) and n in qn]
+    return named[0] if len(named) == 1 else None
 
 
 class MarketCommands:
@@ -90,29 +201,9 @@ class MarketCommands:
         （「头部」命中「XX Prime 头部神经光元蓝图」）。
         """
         if part in ("蓝图", "总图"):
-            # ★ 2026-10-05：skip 与 _PART_SPECIFIC 同步（近战/弓/守护等部件词，
-            #   外加此前漏掉的「头盔」）—— 否则「刀刃蓝图」会被当总图。
-            skip = (
-                "机体",
-                "头部",
-                "系统",
-                "枪管",
-                "枪机",
-                "枪托",
-                "头盔",
-                "握柄",
-                "刀刃",
-                "连接器",
-                "外壳",
-                "弓弦",
-                "弓身",
-                "上弓臂",
-                "下弓臂",
-                "拳套",
-                "武器舱",
-                "镖袋",
-                "护手",
-            )
+            # ★ skip 与 _PART_SPECIFIC 必须同步（结构断言见 tests/test_wm_part.py）；
+            #   常量已提到模块级 `_SET_BLUEPRINT_SKIP`（2026-10-07）。
+            skip = _SET_BLUEPRINT_SKIP
             cands = [
                 p
                 for p in parts
@@ -132,13 +223,25 @@ class MarketCommands:
         if q.group_buy:
             return await self._wm_group_buy(q, platform)
         if not q.item:
-            return Reply(
-                raw_text="用法：wm 物品名 [部件] [收购|合购a*2,b] [N个] [零级/满级/N级] "
-                "[完整/优良/无瑕/光辉] [墨染] [-r]\n"
-                "部件：蓝图（总图）/ 机体 / 系统 / 头部 / 配件（全部部件比价），"
-                "如 wm 母牛 蓝图；头部可连写「头」（wm 水晶头 = wm 水晶 头部）\n"
-                "品级：满级按物品实际满级（赋能 5 级 / 川流不息 5 级 / "
-                "生命力 10 级）；精炼档只对遗物，墨染只看墨染 Mod"
+            return err_card(
+                "没有写物品名",
+                "按 wm 物品名 [部件] … 的格式重发，例如「wm 母牛 蓝图」",
+                (
+                    "用法",
+                    "wm 物品名 [部件] [收购|合购a*2,b] [N个] [零级/满级/N级] "
+                    "[完整/优良/无瑕/光辉] [墨染] [-r]",
+                ),
+                (
+                    "部件",
+                    "蓝图（总图）/ 机体 / 系统 / 头部 / 配件（全部部件比价），"
+                    "如 wm 母牛 蓝图；头部可连写「头」（wm 水晶头 = wm 水晶 头部）",
+                ),
+                (
+                    "品级",
+                    "满级按物品实际满级（赋能 5 级 / 川流不息 5 级 / "
+                    "生命力 10 级）；精炼档只对遗物，墨染只看墨染 Mod",
+                ),
+                title="wm 查价",
             )
         # 「头」部件黑话：消歧在整名解析之前（教训见 _head_part_resolve 注释）
         _head = await _head_part_resolve(self.client, q.item)
@@ -170,13 +273,12 @@ class MarketCommands:
                 picked = self._pick_wm_set_part(set_parts, q.part)
                 if picked is None:
                     names = [p.get("zh") or p.get("en") or p.get("url_name", "") for p in set_parts]
-                    return Reply(
-                        raw_text=(
-                            f"「{item.get('zh') or item.get('en') or item['url_name']}」"
-                            f"没有「{q.part}」这个部件。\n"
-                            f"可用部件：{'、'.join(names) or '（未同步到部件表）'}\n"
-                            f"也可以发整套看全部：wm {q.item}"
-                        )
+                    return err_card(
+                        f"「{item.get('zh') or item.get('en') or item['url_name']}」"
+                        f"没有「{q.part}」这个部件",
+                        f"从可用部件里选一个重发；或发整套看全部：wm {q.item}",
+                        ("可用部件", "、".join(names) or "（未同步到部件表）"),
+                        title="wm 查价",
                     )
                 item = picked
         # ── 品级 / 遗物精炼 / 墨染 过滤（2026-09-25 补：解析早就有，一直没接）──
@@ -241,6 +343,7 @@ class MarketCommands:
                 lines.append(
                     f"※ 想看某个部件的在售/收购单：wm {q.item} 蓝图（或 机体 / 系统 / 头部）"
                 )
+        lines = fmt.limit_notes(lines)  # 注脚收口到卡尾、最多 3 行
         reply = Reply(
             title, lines, footer=fmt.fmt_platform_footer(platform, "warframe.market" + hint)
         )
@@ -302,11 +405,10 @@ class MarketCommands:
             if re.sub(r"[\s·・]+", "", _k).lower() == _nq:
                 _info = self.client.lich_weapon_info(_slug)
                 _zh = _info.get("zh") or _slug
-                return Reply(
-                    raw_text=(
-                        f"「{query}」是玄骸武器（{_zh}），不在集市物品表里。\n"
-                        f"价格用：xh {_zh}　（支持元素/数值筛选，如 xh {_zh} 辐射 50）"
-                    )
+                return err_card(
+                    f"「{query}」是玄骸武器（{_zh}），不在集市物品表里",
+                    f"改用 xh {_zh}　（支持元素/数值筛选，如 xh {_zh} 辐射 50）",
+                    title="wm 查价",
                 )
         items = await self.client.wm_items()
         slugs = [it.get("url_name", "") for it in items]
@@ -317,19 +419,29 @@ class MarketCommands:
             for h in api_client.fuzzy_hits(query, names, n=3):
                 if h not in hits:
                     hits.append(h)
-        tip = f"没有找到「{query}」" + (
-            f"，你是不是想找：{'、'.join(hits[:3])}"
-            if hits
-            else "（可用英文名或在 core/data/aliases.json 中补词条）"
+        if hits:
+            return err_card(
+                f"没有找到「{query}」",
+                "照候选改名重发，或换英文名",
+                ("你是不是想找", "、".join(hits[:3])),
+                title="wm 查价",
+            )
+        return err_card(
+            f"没有找到「{query}」",
+            "换英文名重发（或在 core/data/aliases.json 中补词条）",
+            title="wm 查价",
         )
-        return Reply(raw_text=tip)
 
     async def _wm_group_buy(self, q, platform) -> Reply:
         sellers: dict[str, dict] = {}
         for name, qty in q.group_buy:
             item = await self.client.resolve_wm_item(name)
             if not item:
-                return Reply(raw_text=f"合购中有物品未找到：{name}")
+                return err_card(
+                    f"合购中有物品未找到：{name}",
+                    "检查该名称写法（可换英文名）后重发，或把它从合购单里去掉",
+                    title="wm 合购",
+                )
             orders, _ = await self.client.wm_orders(item["url_name"], platform)
             sells = [
                 o
@@ -347,15 +459,29 @@ class MarketCommands:
             sellers.items(),
             key=lambda kv: (-len(kv[1]["items"]), sum(p * c for p, c in kv[1]["items"].values())),
         )
+        n_items = len(q.group_buy)
         lines = []
-        for seller, info in ranked[:3]:
+        for rank_i, (seller, info) in enumerate(ranked[:3]):
             total = sum(p * c for p, c in info["items"].values())
             covered = len(info["items"])
-            lines.append(f"🟢 {seller}｜覆盖 {covered}/{len(q.group_buy)} 件｜合计约 {total}p")
+            if rank_i == 0:  # 卡首答案：最优卖家
+                lines.append(f"◆ 最优卖家：{seller}｜覆盖 {covered}/{n_items} 件｜合计约 {total}p")
+                lines.append("◆ 候选卖家（覆盖件数多优先，其次合计价低）")
+                lines.append("　卖家　覆盖　合计")
+            lines.append(f"· {seller}　{covered}/{n_items} 件　约 {total}p")
             for url, (p, c) in info["items"].items():
-                lines.append(f"　· {url} × {c} = {p * c}p")
+                lines.append(f"　{url} × {c} = {p * c}p")
+        dropped = getattr(q, "group_buy_dropped", 0)
+        cap_tip = f"※ ⚠ 合购单最多 {GROUP_BUY_MAX} 项，超出的 {dropped} 项已忽略" if dropped else ""
         if not lines:
-            return Reply(raw_text="暂时没有在线卖家能凑齐合购单")
+            return err_card(
+                "暂时没有在线卖家能凑齐合购单",
+                "稍后重试；或减少合购项数、换成单件分开查（wm 物品名）",
+                cap_tip.replace("※ ⚠ ", "⚠ ") if cap_tip else "",
+                title="wm 合购",
+            )
+        if cap_tip:
+            lines.append(cap_tip)
         return Reply(
             "合购最优卖家（同卖家买齐更省事）", lines, footer=fmt.fmt_platform_footer(platform)
         )
@@ -389,15 +515,32 @@ class MarketCommands:
 
         q = parse_wr(parsed.content)
         if not q.weapon:
-            return Reply(
-                raw_text="用法：wr 武器名 [最新|离线] [r槽/-槽/角槽] [1000p] "
-                "[零洗/低洗/废洗/N洗] [词条连写如:基多暴负变焦] [2+|3+1] [-r]"
+            return err_card(
+                "没有写武器名",
+                "按 wr 武器名 [筛选词] 的格式重发，例如「wr 绝路 暴击」",
+                (
+                    "用法",
+                    "wr 武器名 [最新|离线] [r槽/-槽/角槽] [1000p] "
+                    "[零洗/低洗/废洗/N洗] [词条连写如:基多暴负变焦] [2+|3+1] [-r]",
+                ),
+                title="紫卡拍卖",
             )
         weapon = await self.client.resolve_riven_weapon(q.weapon)
         if not weapon:
             tips = await self.client.suggest_riven_weapons(q.weapon)
-            tip = ("，你是不是想找：" + "、".join(tips)) if tips else ("，请使用英文名或补充别名表")
-            return Reply(raw_text=f"未找到紫卡武器「{q.weapon}」{tip}")
+            if tips:
+                return err_card(
+                    f"未找到紫卡武器「{q.weapon}」",
+                    "照候选改名重发",
+                    ("你是不是想找", "、".join(tips)),
+                    title="紫卡拍卖",
+                )
+            return err_card(
+                f"未找到紫卡武器「{q.weapon}」",
+                "请使用英文名，或补充别名表后重发",
+                title="紫卡拍卖",
+            )
+        asked = weapon
         weapon = await riven_market_weapon(self.client, q.weapon, weapon)
         url_name = weapon["url_name"]
         rtype = weapon.get("riven_type", "")
@@ -417,6 +560,23 @@ class MarketCommands:
         neg_set = set(negatives)
         pos_set = set(positives)
         pool = [a for a in auctions if self._auction_match(a, q, neg_set, pos_set)]
+        # ★ 2026-10-08：可追溯日志 —— 「卡上少一条」类问题直接从日志对：
+        #   API 回来多少 / 本地筛完多少 / 各状态几条（用户报障时按这个对 WM 网页）。
+        _st = collections.Counter(
+            ((a.get("owner") or {}).get("status") or "offline") for a in auctions
+        )
+        _st2 = collections.Counter(
+            ((a.get("owner") or {}).get("status") or "offline") for a in pool
+        )
+        logger.info(
+            "[sdjk] wr 挂单池：API %d 条%s → 本地筛后 %d 条%s（武器 %s，词条 %s）",
+            len(auctions),
+            dict(_st),
+            len(pool),
+            dict(_st2),
+            url_name,
+            sorted(pos_set),
+        )
         relaxed = ""
         if not pool and auctions and (q.stats or q.negatives):
             # 严格匹配为空时分两档放宽（2026-09-24 用户报障「前排出现不匹配的
@@ -484,17 +644,27 @@ class MarketCommands:
             presorted=bool(relaxed),
             exact_ids=exact_ids,
         )
-        if weapon.get("_fuzzy_from"):
-            lines.insert(0, f"※ 「{weapon['_fuzzy_from']}」按「{weapon.get('zh') or wname}」查询")
+        _asked = asked.get("zh") or asked.get("en") or asked.get("url_name")
+        if url_name != asked.get("url_name"):
+            # ★ 2026-10-10：变体（Dex/Prime/棱晶/赤毒…）改查家族主武器 ⇒ 卡面写明，
+            #   免得玩家以为把「Dex 侍刃」看成了「侍刃」。
+            lines.insert(0, f"※ 紫卡按家族挂单，「{_asked}」已按主武器「{wname}」查")
+        if asked.get("_fuzzy_from"):  # 形近兜底标记在解析结果上（改查主武器后仍要提示）
+            lines.insert(0, f"※ 「{asked['_fuzzy_from']}」按「{_asked}」查询")
+        _off = [a for a in pool if ((a.get("owner") or {}).get("status") or "offline") == "offline"]
+        if _off:
+            lines.append(f"※ 含 {len(_off)} 条离线挂单（已排在在线之后）")
         if relaxed == "offline":
             lines.append("※ 完全符合词条的挂单卖家目前都不在线，已按 在线优先 → 价格升序 列出")
         elif relaxed == "loose":
             lines.append("※ 没有完全符合条件的挂单，以上按词条命中率与价格给出最接近选项")
+        # 「加 -r 生成密语」是用法提示，进页脚（与 wm 同口径）；注脚收口到卡尾、最多 3 行
+        _hint = "" if parsed.whisper or not best else " · 加 -r 生成游戏内私聊密语"
         reply = Reply(
-            title, lines, footer=fmt.fmt_platform_footer(platform, "warframe.market 紫卡")
+            title,
+            fmt.limit_notes(lines),
+            footer=fmt.fmt_platform_footer(platform, "warframe.market 紫卡" + _hint),
         )
-        if not parsed.whisper:
-            reply.lines.append("※ 加 -r 生成游戏内私聊密语（与卖家的 /w 消息）")
         if parsed.whisper and best:
             item = best.get("item", {}) or {}
             price = best.get("buyout_price") or best.get("starting_price")
@@ -515,10 +685,10 @@ class MarketCommands:
         return Reply(
             "价格排行",
             [
-                "◆ 全量价格榜单还未建立",
-                "　发「排行 刷新」启动后台抓取",
-                "　（WM 全量约 3800 项、限速约 20 分钟，期间排行照常可查）",
-                "　完成后：「排行」看 甲/武器/卡 三榜，「排行 分类」看 20 名完整榜",
+                "◆ 状态：全量价格榜单还未建立",
+                "※ ⚠ 怎么改：发「排行 刷新」启动后台抓取（WM 全量约 3800 项、限速约 20 分钟，"
+                "期间排行照常可查）",
+                "※ 完成后：「排行」看 甲/武器/卡 三榜，「排行 分类」看 20 名完整榜",
             ],
             footer=fmt.fmt_platform_footer(platform, "warframe.market"),
         )
@@ -532,8 +702,8 @@ class MarketCommands:
             return Reply(
                 "排行刷新",
                 [
-                    f"◆ {state}（WM 全量 {total or '约 3800'} 项，限速约 20 分钟）",
-                    f"　当前进度：{done}/{total or '?'}",
+                    f"◆ 状态：{state}（WM 全量 {total or '约 3800'} 项，限速约 20 分钟）",
+                    f"◆ 当前进度：{done}/{total or '?'}",
                     "※ 抓取期间排行照常可查（显示已完成部分）；可稍后重发本指令看进度",
                 ],
                 footer=fmt.fmt_platform_footer(platform, "warframe.market"),
@@ -558,10 +728,11 @@ class MarketCommands:
                 title, lines, footer=fmt.fmt_platform_footer(platform, "warframe.market 成交")
             )
         if cat not in self.client.RANK_CATEGORIES:
-            return Reply(
-                raw_text=f"未知分类「{cat}」。可选："
-                + " / ".join(self._RANK_CN)
-                + "；紫卡排行请发「紫卡排行」"
+            return err_card(
+                f"未知分类「{cat}」",
+                "从可选分类里选一个重发；紫卡排行请发「紫卡排行」",
+                ("可选", " / ".join(self._RANK_CN)),
+                title="市场排行",
             )
         rows = self.client.rank_rows()
         if not rows:
@@ -575,7 +746,12 @@ class MarketCommands:
         try:
             snap = await self.client.de_weekly_rivens(platform, force="刷新" in content)
         except Exception as e:  # noqa: BLE001
-            return Reply(raw_text=f"紫卡周报暂时拉取失败：{e}")
+            logger.warning("[sdjk] 紫卡周报拉取失败：%r", e)
+            return err_card(
+                f"紫卡周报暂时拉取失败：{api_client.public_error_text(e)}",
+                "稍后重发「紫卡排行」",
+                title="紫卡排行",
+            )
         zhm = {
             w.get("en", "").lower(): (w.get("zh") or "")
             for w in await self.client.wm_riven_weapons()
@@ -599,9 +775,11 @@ class MarketCommands:
         """物品价格趋势（48h 逐小时 + 90d 逐日）。"""
         name = parsed.content_str.strip()
         if not name:
-            return Reply(
-                raw_text="用法：趋势 物品名（也支持「wm趋势 物品名」）\n"
-                "　例：趋势 膛线　｜　趋势 绝路Prime"
+            return err_card(
+                "没有写物品名",
+                "按 趋势 物品名 的格式重发，例如「趋势 膛线」「趋势 绝路Prime」",
+                ("用法", "趋势 物品名（也支持「wm趋势 物品名」）"),
+                title="价格趋势",
             )
         item = await self.client.resolve_wm_item(name)
         if not item:
@@ -676,9 +854,12 @@ class MarketCommands:
             # 离线，也比「词条不匹配的在线单」值得排在前面（2026-09-24）。
             return True
         status = (a.get("owner", {}) or {}).get("status")
+        # ★ 2026-10-08（用户口径）：**默认不再把离线挂单藏起来** ——
+        #   「即使某个词条的在线挂单只有一张，也要把离线的也列出来」。旧行为只在
+        #   「完全匹配的在线单为 0」时才走 relaxed=offline 兜底 ⇒ 像「伯斯顿 + 弱点暴击几率」
+        #   那种「唯一一张还离线」的场景直接空卡。现在默认（recent/在线）= 全部状态，
+        #   靠渲染层「在线优先」把离线排到后面并标 ⚫离线；只有显式「最新」才只留游戏中。
         if q.status == "latest" and status != "ingame":
-            return False
-        if q.status == "recent" and status not in ("ingame", "online"):
             return False
         return True
 
@@ -715,9 +896,7 @@ class MarketCommands:
         pages = max(1, (total + page_size - 1) // page_size)
         page = max(1, min(parsed.page, pages))
         chunk = pool[(page - 1) * page_size : page * page_size]
-        title, lines = fmt.fmt_ducat_junk(tier, chunk, page=page, pages=pages)
-        if pages > 1:
-            lines.append(f"※ 第{page}/{pages}页，共{total}件；加 -2 / -3 翻页")
+        title, lines = fmt.fmt_ducat_junk(tier, chunk, page=page, pages=pages, total=total)
         return Reply(
             title, lines, footer=fmt.fmt_platform_footer(platform, "杜卡德/白金 越高越值得换")
         )

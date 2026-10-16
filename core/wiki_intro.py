@@ -20,6 +20,11 @@ try:
 except ImportError:  # 离线脚本把 core/ 当顶层路径导入时
     import matching
 
+try:
+    from . import paths as _paths  # 共享只读 JSON 缓存（drops.json 三处读者同一份）
+except ImportError:  # 离线脚本把 core/ 当顶层路径导入时
+    import paths as _paths
+
 _FILE = Path(__file__).resolve().parent / "data" / "wiki_intro.json"
 _DROPS_FILE = Path(__file__).resolve().parent / "data" / "drops.json"
 _EFFECT_ZH_FILE = Path(__file__).resolve().parent / "data" / "wiki_effect_zh.json"
@@ -195,6 +200,21 @@ def available() -> bool:
     return bool(_table()[1])
 
 
+# 简介数据里的「标签：值」行 → 行文法的 KV 行（◆ 标签：值）；叙述性正文（无标签）原样保留。
+_KV_LINE_RE = re.compile(
+    r"^(?:(类型)(?:[：:]\s*|\s*)|(定位|获取|效果（[^）]{1,12}）|效果|建造材料|说明|简介|数据|特性|属性"
+    r"|总伤害|可交易|商店|自带极性|用途|技能|被动|状态)(?:[：:]\s*|\s+))(\S.*)$"
+)
+
+
+def _kvify(line: str) -> str:
+    """「类型 主武器 MOD｜…」「效果（满级 3）：…」→「◆ 类型：…」「◆ 效果（满级 3）：…」。"""
+    m = _KV_LINE_RE.match(line)
+    if not m:
+        return line
+    return f"◆ {m.group(1) or m.group(2)}：{m.group(3).strip()}"
+
+
 def intro(*names: str) -> Optional[tuple[str, list[str]]]:
     """按候选名字（页面名 / 检索名 / 英文名）查简介条目。
 
@@ -210,17 +230,17 @@ def intro(*names: str) -> Optional[tuple[str, list[str]]]:
         if isinstance(i, int) and 0 <= i < len(entries):
             e = entries[i]
             if isinstance(e, list) and len(e) == 2:
-                return str(e[0]), [_localize(_localize_effect(str(x))) for x in e[1]]
+                return str(e[0]), [_kvify(_localize(_localize_effect(str(x)))) for x in e[1]]
     return None
 
 
 @lru_cache(maxsize=1)
 def _drops() -> tuple[dict, dict, dict, dict]:
-    """drops.json 的 (items, 归一化英文名 → 原键, places, zh2en)。"""
-    try:
-        d = json.loads(_DROPS_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}, {}, {}, {}
+    """drops.json 的 (items, 归一化英文名 → 原键, places, zh2en)。
+
+    原表经 ``paths.load_json`` 与 core/drops.py、core/search.py 共享（只读，不得就地修改）。
+    """
+    d = _paths.load_json(_DROPS_FILE)
     if not isinstance(d, dict):
         return {}, {}, {}, {}
     items = d.get("items") or {}
@@ -259,15 +279,16 @@ def _drops_card(*names: str, limit: int = 5) -> Optional[tuple[str, list[str]]]:
         # 遗物来源（「Lith T1 Relic (Exceptional)」这类）对「在哪刷」没用，
         # 排到任务节点后面，再按几率降序
         relic = ("relic" in place.lower()) or ("遗物" in place)
-        return (relic, -float(row[2]))
+        # 掉率可能缺失（drops.json 里少数条目 chance 为 None）：排最后，不让整张卡崩掉
+        return (relic, -float(row[2]) if row[2] is not None else 1.0)
 
     rows = sorted(srcs, key=_rank)[:limit]
     title = (names[0] or key).strip() or key
-    lines = [f"掉落来源（共 {len(srcs)} 处，按几率排序）："]
+    lines = [f"◆ 掉落来源（共 {len(srcs)} 处，按几率排序）", "　来源　几率"]
     for row in rows:
         pid, _rarity, chance = row[0], row[1], row[2]
-        place = places.get(str(pid)) or places.get(pid) or "?"
-        lines.append(f"· {place}（{chance}%）")
+        place = str(places.get(str(pid)) or places.get(pid) or "?").replace("　", " ")
+        lines.append(f"· {place}　{chance}%" if chance is not None else f"· {place}　几率未知")
     return title, lines
 
 
@@ -292,8 +313,8 @@ def _uses_card(*names: str, limit: int = 5) -> Optional[tuple[str, list[str]]]:
     if not prods:
         return None
     title = (names[0] or prods[0]).strip() or prods[0]
-    lines = [f"用途：用于制造（共 {hit.get('n', len(prods))} 个配方）："]
-    lines += [f"· {p}" for p in prods]
+    lines = [f"◆ 用途 · 用于制造（共 {hit.get('n', len(prods))} 个配方）"]
+    lines += [f"· {str(p).replace('　', ' ')}" for p in prods]
     return title, lines
 
 
@@ -328,6 +349,27 @@ def _relic_key(name: str) -> str:
     return f"{cn} {en} {code.upper()}"
 
 
+def relic_rewards(name: str) -> Optional[dict]:
+    """遗物名 → ``{"稀有"/"罕见"/"常见": [部件…]}``；查不到返回 None（不猜）。
+
+    中英文写法都吃：「古纪 K5 遗物」（DE 简中）/「Lith B12 Relic」（新出库遗物简中词表常缺，
+    回落英文名 —— 2026-10-16 实测本期 6 个出库遗物全是英文名）/「后纪A2」。
+    """
+    s = re.sub(r"(?i)\s*(?:遗物|relics?)\s*$", "", (name or "").strip())
+    m = re.match(r"^([A-Za-z]+)\s*([A-Za-z]\d{1,2})$", s)
+    if m:
+        en2cn = {en.lower(): cn for cn, en in _TIER_CN.items()}
+        cn = en2cn.get(m.group(1).lower())
+        if not cn:
+            return None
+        s = f"{cn}{m.group(2)}"
+    key = _relic_key(s)
+    if not key:
+        return None
+    idx, _inv = _relics()
+    return idx.get(key) or None
+
+
 def _relic_card(*names: str, limit: int = 3) -> Optional[tuple[str, list[str]]]:
     """遗物卡：三档奖励（前纪 V11 遗物这类 —— 知识库/掉落表都没有条目）。"""
     idx, _inv = _relics()
@@ -350,9 +392,10 @@ def _relic_card(*names: str, limit: int = 3) -> Optional[tuple[str, list[str]]]:
     for tag in ("常见", "罕见", "稀有"):
         items = [str(x) for x in (rar.get(tag) or [])]
         if items:
-            lines.append(f"{tag}：{'、'.join(items[:limit])}")
+            lines.append(f"· {tag}　{'、'.join(items[:limit])}")
     if not lines:
         return None
+    lines.insert(0, "◆ 奖励（三档）")
     title = next((n for n in names if (n or "").strip()), hit).strip() or hit
     return title, lines
 
@@ -375,8 +418,8 @@ def _relic_part_card(*names: str, limit: int = 8) -> Optional[tuple[str, list[st
     if not rows:
         return None
     title = next((n for n in names if (n or "").strip()), hit).strip() or hit
-    lines = [f"所在遗物（共 {len(rows)} 个）："]
-    lines += [f"· {r.get('relic')}（{r.get('rarity')}）" for r in rows[:limit]]
+    lines = [f"◆ 所在遗物（共 {len(rows)} 个）", "　遗物　稀有度"]
+    lines += [f"· {r.get('relic')}　{r.get('rarity')}" for r in rows[:limit]]
     return title, lines
 
 
@@ -385,7 +428,7 @@ def _minimal_card(*names: str) -> Optional[tuple[str, list[str]]]:
     title = next((n.strip() for n in names if (n or "").strip()), "")
     if not title:
         return None
-    return title, ["本地资料库暂无该条目的简介，详见下方 wiki 页面"]
+    return title, ["◆ 状态：本地资料库暂无该条目的简介", "※ 详见下方 wiki 页面链接"]
 
 
 def card_for(*names: str) -> Optional[tuple[str, list[str]]]:

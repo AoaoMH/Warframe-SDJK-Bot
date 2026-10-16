@@ -19,6 +19,11 @@ from core import damage_calc as dc  # noqa: E402
 FAILED: list[str] = []
 
 
+def _panel_row(lines: list[str]) -> str:
+    """卡面「· 面板　基伤…｜暴击…｜射速…」行（2026-10-11 改版前是 lines[1] 的「　基伤…」缩进行）。"""
+    return next(x for x in lines if x.startswith("· 面板"))
+
+
 def check(name: str, cond: bool, detail: str = ""):
     status = "PASS" if cond else "FAIL"
     print(f"[{status}] {name}" + (f"  -> {detail}" if detail and not cond else ""))
@@ -142,9 +147,18 @@ check("打血 < 打盾（有甲）", res["health"] < res["shield"])
 check("打盾剔除毒素", close(res["per_type_shield"].get("toxin", 0.0), 0.0))
 # 基伤不加成时：血量总伤 = 面板总伤 ×(1-DR)×(各类型派系倍率)
 raw_total = w4["damage"]["total"]
-mult_expect = (1.2 * 1.5 + 6 * 1.0 + 4.8 * 1.0) / raw_total  # 仅冲击 对 G ×1.5
+# 2026-10-10：伤害先量化（各类型取整到 总伤/32 的整数倍，wiki Damage/Calculation
+# §Quantization）—— Soma 12 = 1.2/6/4.8 ⇒ 刻度 0.375：3.2→3、16→16、12.8→13 单位
+# ⇒ 1.125 / 6 / 4.875（原式直接用 1.2 / 6 / 4.8）
+_q = dc.quantize_damage({"impact": 1.2, "slash": 6.0, "puncture": 4.8}, raw_total)
 check(
-    "端到端：打血 = Σ类型×(1-DR)",
+    "Soma 量化分量 = 1.125 / 6 / 4.875",
+    close(_q["impact"], 1.125) and close(_q["slash"], 6.0) and close(_q["puncture"], 4.875),
+    str(_q),
+)
+mult_expect = (_q["impact"] * 1.5 + _q["slash"] * 1.0 + _q["puncture"] * 1.0) / raw_total
+check(
+    "端到端：打血 = Σ量化后类型×(1-DR)",
     close(res["health"], raw_total * (1 - res["dr"]) * mult_expect, 1e-4),
     f"{res['health']} vs {raw_total * (1 - res['dr']) * mult_expect}",
 )
@@ -206,9 +220,10 @@ check(
 
 spec_ele, _ = dc.parse_args(["基础形态", "G系", "30级", "电90"])
 re_ele = dc.calculate(spec_ele, w4)
-_exp_ele = (base_after + 1.0) * 0.5 * 6 * re_ele["crit_exp"] * (1 - re_ele["dr"])
+# 2026-10-09 B1：电 / 火 / 毒 DoT 再乘本元素 MOD 括号（wfsim procs.rs elem_bracket）⇒ 电90 ×1.9
+_exp_ele = (base_after + 1.0) * 0.5 * 6 * re_ele["crit_exp"] * (1 - re_ele["dr"]) * 1.9
 check(
-    "电击 DoT = 0.5×(基伤+1)×6×暴击期望×(1-DR)",
+    "电击 DoT = 0.5×(基伤+1)×6×暴击期望×(1-DR)×(1+电MOD 90%)",
     close(re_ele["dots"].get("electricity", 0.0), _exp_ele, 1e-4),
     f"{re_ele['dots'].get('electricity')} vs {_exp_ele}",
 )
@@ -372,7 +387,8 @@ check(
     close(res_fb["fire_rate"], w_rp["fireRate"], 1e-6),
     f"{res_fb['fire_rate']} vs {w_rp['fireRate']}",
 )
-check("爆头倍率 2.0 → 2.6（只放大超出 1 的部分）", close(res_fb["head_mult"], 1 + (2.0 - 1) * 1.6))
+# 2026-10-10 爆头口径批：加成放大整个部位倍率（wiki Enemy_Body_Parts 15.9375x 例 / wfsim pellet.rs:561）
+check("爆头倍率 3.0 ×(1+60%) → 4.8", close(res_fb["head_mult"], 3.0 * 1.6))
 spec_nc, _ = dc.parse_args(["绝路p", "关键延迟"])
 res_nc = dc.calculate(spec_nc, w_rp)
 check(
@@ -380,7 +396,7 @@ check(
     close(res_nc["fire_rate"], w_rp["fireRate"] * 0.8, 1e-6),
     f"{res_nc['fire_rate']}",
 )
-check("不配 Cannonade 时爆头仍是 2.0", close(res_nc["head_mult"], 2.0))
+check("不配 Cannonade 时爆头仍是人形 3.0", close(res_nc["head_mult"], 3.0))
 
 # 完全没进名表的词：不能毁掉整条指令，要单独报出来
 spec_u, name_u = dc.parse_args(["绝路p", "假装这是张卡"])
@@ -411,7 +427,19 @@ spec_rp, _ = dc.parse_args(["绝路p", "切90"])
 res_rp = dc.calculate(spec_rp, w_rp2)
 plain = dc.calculate(dc.parse_args(["绝路p"])[0], w_rp2)
 ratio = res_rp["per_type_health"]["slash"] / plain["per_type_health"]["slash"]
-check("切割MOD 让切割项 ×1.9（只吃同类型基础值）", close(ratio, 1.9, 1e-6), f"{ratio}")
+# 2026-10-10 加量化后：比值 = 量化(9.3×1.9) / 量化(9.3)（刻度 187/32：3 单位 / 2 单位 = 1.5；
+# 量化前恰为 1.9）。若错吃总基伤（9.3+90%×187）会是 30/2 = 15，仍能区分
+_sl = float(w_rp2["damage"]["slash"])
+_tot = float(w_rp2["damage"]["total"])
+_r_exp = (
+    dc.quantize_damage({"slash": _sl * 1.9}, _tot)["slash"]
+    / dc.quantize_damage({"slash": _sl}, _tot)["slash"]
+)
+check(
+    "切割MOD 让切割项 ×1.9（只吃同类型基础值；量化后 = 1.5）",
+    close(ratio, _r_exp, 1e-6) and close(_r_exp, 1.5),
+    f"{ratio} vs {_r_exp}",
+)
 check(
     "切割MOD 不动冲击项",
     close(res_rp["per_type_health"]["impact"], plain["per_type_health"]["impact"], 1e-9),
@@ -438,8 +466,9 @@ w_phy1 = {
 }
 res_p1 = dc.calculate(spec_p1, w_phy1)
 check(
-    "切割基础 50 + 90% → 95（不是 50+90%×100=140）",
-    close(res_p1["per_type_health"]["slash"] / (1 - res_p1["dr"]), 95.0, 1e-6),
+    # 2026-10-10 加量化：95 再取整到 100/32 的整数倍 = 30 单位 = 93.75（错算的 140 → 140.625）
+    "切割基础 50 + 90% → 95（量化后 93.75；不是 50+90%×100=140）",
+    close(res_p1["per_type_health"]["slash"] / (1 - res_p1["dr"]), 93.75, 1e-6),
     str(res_p1["per_type_health"]),
 )
 
@@ -465,8 +494,9 @@ check(
 )
 _linesA = dc.card_lines(_wR, _sA, _rA)
 _linesB = dc.card_lines(_wR, _sB, _rB)
-_dpsA = [ln for ln in _linesA if ln.startswith("◆ DPS")]
-_dpsB = [ln for ln in _linesB if ln.startswith("◆ DPS")]
+# 2026-10-11 卡片改版：「◆ DPS 爆发/持续」→ 卡首 KV「◆ 爆发 DPS / ◆ 持续 DPS」
+_dpsA = [ln for ln in _linesA if ln.startswith("◆ 爆发 DPS")]
+_dpsB = [ln for ln in _linesB if ln.startswith("◆ 爆发 DPS")]
 check(
     "DPS 爆发行同时给出「含暴击」与「无暴击」",
     _dpsA and "含暴击" in _dpsA[0] and "无暴击" in _dpsA[0],
@@ -474,17 +504,17 @@ check(
 )
 check(
     "DPS 持续行给出弹匣+装填循环",
-    any(ln.startswith("◆ DPS 持续") and "装填" in ln for ln in _linesA),
-    str([ln for ln in _linesA if ln.startswith("◆ DPS")]),
+    any(ln.startswith("◆ 持续 DPS") and "装填" in ln for ln in _linesA),
+    str([ln for ln in _linesA if "DPS" in ln]),
 )
 check(
     "两套卡的含暴击 DPS 确实不同", _dpsA and _dpsB and _dpsA[0] != _dpsB[0], f"{_dpsA} vs {_dpsB}"
 )
 check(
-    "每次扳机行也带「含暴击」",
-    any(ln.startswith("◆ 每次扳机") and "含暴击" in ln for ln in _linesA),
+    "每次扳机 / 单发（对血行已并入时）也带「含暴击」",
+    any(ln.startswith(("· 每次扳机", "· 单发", "· 对血")) and "含暴击" in ln for ln in _linesA),
 )
-check("单发行标注「无暴击」", any("单发对血" in ln and "无暴击" in ln for ln in _linesA))
+check("对血行标注「无暴击」", any(ln.startswith("· 对血") and "无暴击" in ln for ln in _linesA))
 
 
 # ---------------------------------------------------------------------------
@@ -695,29 +725,165 @@ check(
     str(_g5["dmg_per_status"]),
 )
 
+# 2026-10-09：条件叠层 field="fire_rate" 必须落到 spec["fire_rate_pct"]（修前写进无人读取的
+# spec["fire_rate"]，卡面写「+90%」而射速纹丝不动）。5 张 MOD 逐张验 + 端到端射速。
+for _fr_mod, _fr_want in (
+    ("Archgun Ace", 50.0),
+    ("Spring-Loaded Chamber", 75.0),
+    ("Berserker Fury", 70.0),  # 35% × 2 层
+    ("Pressurized Magazine", 90.0),
+    ("Repeater Clip", 105.0),
+):
+    _gf, _ = dc.parse_args([_fr_mod, "满镀层"])
+    check(
+        f"满镀层：{_fr_mod} 射速 → fire_rate_pct {_fr_want:g}",
+        close(_gf["fire_rate_pct"], _fr_want) and "fire_rate" not in _gf,
+        f"{_gf['fire_rate_pct']} / leak={_gf.get('fire_rate')}",
+    )
+    _gn, _ = dc.parse_args([_fr_mod])
+    check(f"未指定层数：{_fr_mod} 射速不计入", close(_gn["fire_rate_pct"], 0.0))
+_w_lex, _ = dc.find_weapon("Lex")
+_s_pm0, _ = dc.parse_args(["Pressurized Magazine"])
+_s_pm1, _ = dc.parse_args(["Pressurized Magazine", "满镀层"])
+_fr0 = dc.calculate(_s_pm0, _w_lex)["fire_rate"]
+_fr1 = dc.calculate(_s_pm1, _w_lex)["fire_rate"]
+check("端到端：增压弹匣 满镀层 射速 ×1.9", close(_fr1, _fr0 * 1.9, 1e-9), f"{_fr0} → {_fr1}")
+
+# 赋能折算循环的同名隐患：效果键 fire_rate 原写法 spec["fire_rate"] += … 会 KeyError。
+# 现有数据里没有能走到这里的赋能（54 条的 effects 只有 conditional/headshot_bonus/
+# reload_pct），故临时注入一条**合成**赋能覆盖该分支，用完还原。
+_arc_pool = dc.arcanes_payload()
+_arc_pool["__test_fr__"] = {
+    "name": "Test Fire Rate Arcane",
+    "zh": "测试射速赋能",
+    "text": "+10% fire rate",
+    "effects": {"fire_rate": 10.0},
+}
+try:
+    _sa, _ = dc.parse_args(["赋能", "测试射速赋能"])
+    check(
+        "赋能折算：fire_rate 映射到 fire_rate_pct（不再 KeyError）",
+        close(_sa["fire_rate_pct"], 10.0),
+    )
+finally:
+    _arc_pool.pop("__test_fr__", None)
+
 
 # ---------------------------------------------------------------------------
-# 形态：有灵化数据的武器默认开灵化（v1.11，2026-09-17 用户要求）
+# 形态：默认原型，写「灵化」才切灵化形态
+# （2026-10-09 用户拍板改回，推翻 2026-09-17「默认开灵化」：wfsim 74 个可转灵化的
+#  原型条目全部 default_form: true，灵化是充能后临时切入的形态）
+# ⚠ 断言读实际计算面板 weapon_eff，不靠 note 文本：默认 note「该武器有灵化形态」
+#   本身含「灵化形态」四字，旧的文本断言在改默认后仍会假通过。
 # ---------------------------------------------------------------------------
 _w_lat, _ = dc.find_weapon("拉特昂 Prime")
 _s_def, _ = dc.parse_args([])
 _r_def = dc.calculate(_s_def, _w_lat)
 check(
-    "拉特昂默认开灵化形态（基础 50 而非 90）",
-    any("灵化形态" in n for n in _s_def["notes"]),
-    str(_s_def["notes"])[:120],
+    "拉特昂 Prime 默认 = 原型（基伤 90 / 射速 4.17，非灵化 50 / 3.33）",
+    close(_r_def["weapon_eff"]["damage"]["total"], 90.0)
+    and close(_r_def["weapon_eff"]["fireRate"], 4.166667, 1e-6)
+    and not _r_def["modes"],
+    f"{_r_def['weapon_eff']['damage'].get('total')} / {_r_def['weapon_eff'].get('fireRate')}"
+    f" / modes={[m['name'] for m in _r_def['modes']]}",
 )
 check(
-    "灵化形态 note 带范围段与弹跳标注",
-    any("范围段 140" in n and "弹跳" in n for n in _s_def["notes"]),
+    "默认原型 note 提示可切灵化",
+    any("默认" in n and "灵化" in n for n in _r_def["notes"]),
+    str(_r_def["notes"])[:120],
+)
+_s_inc, _ = dc.parse_args(["灵化"])
+_r_inc = dc.calculate(_s_inc, _w_lat)
+check(
+    "「灵化」切灵化形态（基伤 50 / 射速 3.33）",
+    close(_r_inc["weapon_eff"]["damage"]["total"], 50.0)
+    and close(_r_inc["weapon_eff"]["fireRate"], 3.33),
+    f"{_r_inc['weapon_eff']['damage'].get('total')} / {_r_inc['weapon_eff'].get('fireRate')}",
+)
+# 2026-10-10 生成器批：wfsim @8267f09 删掉了拉特昂家族灵化的 ricochet（latron_prime_incarnon.yaml
+# :54-58「THE BOUNCES ARE NOT MODELLED (MEASUREMENTS M103)… this entry declares none」）⇒ 不再标弹跳
+check(
+    "灵化形态 note 带范围段标注、不再标弹跳（wfsim 已撤 ricochet）",
+    any("范围段 140" in n for n in _r_inc["notes"])
+    and not any("弹跳" in n for n in _r_inc["notes"]),
+    str(_r_inc["notes"])[:200],
+)
+# 2026-10-09 C 批：灵化形态的弹匣 / 装填按 wfsim pseudo_reload（灵化弹池，非弹匣）
+# latron_prime_incarnon.yaml：pseudo_reload {magazine: 40, reload_seconds: 3.4}（切出 1.0 + 切入 2.4）
+check(
+    "灵化形态弹池：拉特昂 Prime 40 发 / 3.4s（原型 15 发 / 2.4s）",
+    close(_r_inc["magazine"], 40.0)
+    and close(_r_inc["reload"], 3.4)
+    and close(_r_def["magazine"], 15.0)
+    and abs(_r_def["reload"] - 2.4) < 1e-6,
+    f"灵化 {_r_inc['magazine']}/{_r_inc['reload']} 原型 {_r_def['magazine']}/{_r_def['reload']}",
+)
+_mt_inc = 40.0 / _r_inc["fire_rate"]
+check(
+    "灵化持续 DPS = 爆发 × 弹池时间 /(弹池时间 + 3.4s)",
+    close(_r_inc["dps_sustained"], _r_inc["dps"] * _mt_inc / (_mt_inc + 3.4), 1e-9),
+    f"{_r_inc['dps_sustained']}",
+)
+_inc_all = {k for k in dc._load_incarnon_forms() if k != "_meta"}
+check(
+    "incarnon_forms.json：69 条全部带 pseudo_reload（弹池上限 / 装填 > 0）",
+    len(_inc_all) == 69
+    and all(
+        (dc._load_incarnon_forms()[k].get("pseudo_reload") or {}).get("magazine", 0) > 0
+        and dc._load_incarnon_forms()[k]["pseudo_reload"].get("reload_seconds", 0) > 0
+        for k in _inc_all
+    ),
 )
 _s_base, _ = dc.parse_args(["基础形态"])
 _r_base = dc.calculate(_s_base, _w_lat)
-check("基础形态参数回退（90 基伤）", any("基础形态" in n for n in _s_base["notes"]))
+check("基础形态参数回退（90 基伤）", any("基础形态" in n for n in _r_base["notes"]))
 check(
     "灵化 vs 基础：基础形态单发更高（90 > 50 基伤口径）",
-    _r_base["health"] > _r_def["health"],
-    f"{_r_base['health']} vs {_r_def['health']}",
+    _r_base["health"] > _r_inc["health"],
+    f"{_r_base['health']} vs {_r_inc['health']}",
+)
+
+# 2026-10-09「射速像被折算两次」：拉特昂 Prime + 关键延迟（−20% 射速）。
+# 游戏截图（普通形态升级界面）「射击速度 4.17 ▸ 3.33」。当时伤害指令默认开灵化，
+# 灵化基础射速 3.33（incarnon_forms.json 与 weapons_stats.json 的 attacks「Incarnon
+# Form」speed 两源一致）⇒ 2.664；同日两处修正：卡面头部改读实际面板 + 默认改回原型。
+_s_cd_def, _ = dc.parse_args(["关键延迟"])
+_r_cd_def = dc.calculate(_s_cd_def, _w_lat)
+check(
+    "拉特昂 Prime + 关键延迟（默认）⇒ 射速 3.3333（截图 4.17 ▸ 3.33）",
+    abs(_r_cd_def["fire_rate"] - 3.3333) <= 0.001,
+    str(_r_cd_def["fire_rate"]),
+)
+_s_cd_base, _ = dc.parse_args(["关键延迟", "基础形态"])
+_r_cd_base = dc.calculate(_s_cd_base, _w_lat)
+check(
+    "拉特昂 Prime + 关键延迟（基础形态）⇒ 射速 3.3333（截图 4.17 ▸ 3.33）",
+    abs(_r_cd_base["fire_rate"] - 3.3333) <= 0.001,
+    str(_r_cd_base["fire_rate"]),
+)
+_s_cd_inc, _ = dc.parse_args(["关键延迟", "灵化"])
+_r_cd_inc = dc.calculate(_s_cd_inc, _w_lat)
+check(
+    "拉特昂 Prime + 关键延迟 + 灵化 ⇒ 射速 3.33×0.8 = 2.664，只乘一次",
+    abs(_r_cd_inc["fire_rate"] - 3.33 * 0.8) <= 0.001
+    and close(_r_cd_inc["weapon_eff"]["fireRate"], 3.33),
+    f"{_r_cd_inc['fire_rate']} / eff {_r_cd_inc['weapon_eff'].get('fireRate')}",
+)
+_hdr_inc = _panel_row(dc.card_lines(_w_lat, _s_cd_inc, _r_cd_inc, []))
+_hdr_base = _panel_row(dc.card_lines(_w_lat, _s_cd_base, _r_cd_base, []))
+check(
+    "卡面头部（灵化）按实际计算面板：基伤 50 / 暴击 44% ×3.4 / 射速 3.33 ▸ 2.66",
+    "基伤 50" in _hdr_inc and "暴击 44% ×3.4" in _hdr_inc and "射速 3.33 ▸ 2.66" in _hdr_inc,
+    _hdr_inc,
+)
+check(
+    "卡面头部（基础形态）与游戏面板同口径：基伤 90 / 射速 4.17 ▸ 3.33",
+    "基伤 90" in _hdr_base and "射速 4.17 ▸ 3.33" in _hdr_base,
+    _hdr_base,
+)
+check(
+    "无射速 MOD 时头部不出现箭头",
+    "▸" not in _panel_row(dc.card_lines(_w_lat, _s_def, _r_def, [])),
 )
 
 # 灵化形态 + 进化暴击（EVO IV 临界平行 +24% cc / +0.2x cd）
@@ -752,11 +918,14 @@ _s_og, _ = dc.parse_args(["膛线", "镀层 分裂膛室"])
 _r_og = dc.calculate(_s_og, _w_og)
 _st_og = _r_og.get("segments_total") or {}
 check(
-    "食人女魔：段合计 = 主段 + 直击 + 爆炸（3 项都 >0）",
+    "食人女魔：段合计 = 主段 + 爆炸（直击段与主段相同，不再重复计）",
+    # 2026-10-09 订正：旧断言要求「主段 + 直击 + 爆炸」3 项，而「直击」与主段同签名，
+    # 正是被重复加的那一段（wfsim：每发 = 直击 → 范围各一次）
     _st_og.get("main", 0) > 0
     and _st_og.get("segments", 0) > 0
     and _st_og.get("total", 0) > _st_og.get("main", 0)
-    and _st_og.get("n_segments", 0) >= 2,
+    and _st_og.get("n_segments", 0) == 1
+    and not any(m.get("same_as_main") and m.get("in_total") for m in _r_og.get("modes") or []),
     str({k: round(v, 1) if isinstance(v, float) else v for k, v in _st_og.items()}),
 )
 check(
@@ -765,11 +934,11 @@ check(
 )
 
 _w_l2, _ = dc.find_weapon("拉特昂 Prime")
-_s_l2, _ = dc.parse_args(["膛线"])
+_s_l2, _ = dc.parse_args(["膛线", "灵化"])
 _r_l2 = dc.calculate(_s_l2, _w_l2)
 _st_l2 = _r_l2.get("segments_total") or {}
 check(
-    "灵化武器默认：段不含重复的灵化主段（只留范围段）",
+    "灵化形态：段不含重复的灵化主段（只留范围段）",
     _st_l2.get("n_segments", 0) == 1,
     str(_st_l2),
 )
@@ -796,7 +965,7 @@ if _w_ay:
     _r_atm = dc.calculate(_s_atm, _w_ay)
     _s_aw, _ = dc.parse_args(["空战"])
     _r_aw = dc.calculate(_s_aw, _w_ay)
-    check("空战部署 note 正确", any("空战（Archwing）" in n for n in _s_aw["notes"]))
+    check("空战部署 note 正确", any("空战（Archwing）" in n for n in _r_aw["notes"]))
     check(
         "空战/地面两套面板数值不同",
         _r_atm["per_trigger_health"] != _r_aw["per_trigger_health"],
@@ -805,6 +974,159 @@ if _w_ay:
     check(
         "空战范围伤害作为独立段计入", (_r_aw.get("segments_total") or {}).get("n_segments", 0) >= 1
     )
+
+# ---------------------------------------------------------------------------
+# 9) 三处折算修正回归（2026-10-06）：物理双写 / 派系卡分桶 / 扳机限制卡
+# ---------------------------------------------------------------------------
+dc.warmup()
+_w_rub, _ = dc.find_weapon("绝路 Prime")
+_w_lex, _ = dc.find_weapon("Lex Prime")
+_w_boar, _ = dc.find_weapon("Boar Prime")
+
+# 9a) 物理加成 MOD 只走 physical 通道（旧数据在 elements 里也有一份，
+#     折算循环两份都吃 → 「破裂 +90% 冲击」实测 DPS×3.3，正确 ≈×1.7）
+_s_r0 = dc.parse_args(["绝路"])[0]
+_s_r1 = dc.parse_args(["绝路", "破裂"])[0]
+check("破裂：impact 不进元素通道（无双写）", "impact" not in _s_r1["singles"])
+check("破裂：physical.impact = +90", close(_s_r1["physical"].get("impact", 0.0), 90.0))
+_rr0 = dc.calculate(_s_r0, _w_rub)
+_rr1 = dc.calculate(_s_r1, _w_rub)
+# 2026-10-10 加量化：比值 = 量化(149.6×1.9)/量化(149.6) = 49/26（双份则 ≈ 2.8）
+_im = float(_w_rub["damage"]["impact"])
+_im_t = float(_w_rub["damage"]["total"])
+_r_im = (
+    dc.quantize_damage({"impact": _im * 1.9}, _im_t)["impact"]
+    / dc.quantize_damage({"impact": _im}, _im_t)["impact"]
+)
+check(
+    "破裂：impact 对血值 ×1.9（无双份；量化后 = 49/26）",
+    close(_rr1["per_type_health"]["impact"] / _rr0["per_type_health"]["impact"], _r_im)
+    and close(_r_im, 49 / 26),
+    f"{_rr1['per_type_health']['impact'] / _rr0['per_type_health']['impact']} vs {_r_im}",
+)
+_s_ab = dc.parse_args(["绝路", "加速冲击"])[0]
+check("加速冲击：puncture 不进元素通道（无双写）", "puncture" not in _s_ab["singles"])
+
+# 9b) 派系卡（faction_of）按派系分桶：打别的派系不生效，混用手输对G照旧
+_s_f = dc.parse_args(["雷克斯", "灭亡 Corpus", "对G10"])[0]
+check(
+    "灭亡 Corpus：进分桶、通用桶只留手输对G",
+    close(_s_f["faction_dmg"], 10.0)
+    and len(_s_f["faction_dmg_of"]) == 1
+    and _s_f["faction_dmg_of"][0][0] == "Corpus",
+)
+_sA = dc.parse_args(["雷克斯", "对G10"])[0]
+_sA["faction"] = "Corpus"
+_sB = dc.parse_args(["雷克斯", "灭亡 Corpus", "对G10"])[0]
+_sB["faction"] = "Corpus"
+check(
+    "打 Corpus：灭亡生效（fac_mod 1.4 vs 1.1）",
+    close(dc.calculate(_sB, _w_lex)["dps"] / dc.calculate(_sA, _w_lex)["dps"], 1.4 / 1.1),
+)
+_sC = dc.parse_args(["雷克斯", "灭亡 Corpus", "对G10"])[0]
+_sC["faction"] = "Grineer"
+_sA2 = dc.parse_args(["雷克斯", "对G10"])[0]
+_sA2["faction"] = "Grineer"
+check(
+    "打 Grineer：灭亡 Corpus 不生效（比值=1）",
+    close(dc.calculate(_sC, _w_lex)["dps"] / dc.calculate(_sA2, _w_lex)["dps"], 1.0),
+)
+
+# 9c) 扳机限制卡（Cannonade 系「仅限半自动扳机」）：Semi 折算、非 Semi 拒绝并注明。
+#     点射（Burst）不算半自动 —— wiki Cannonade 表逐武器核对（Burston 不吃）。
+_s_sc = dc.parse_args(["绝路", "半自动步枪炮轰"])[0]  # Rubico Prime: Semi
+check("绝路(Semi)：半自动炮轰折算 +240% 基伤", close(_s_sc["base_dmg"], 240.0))
+_s_bc = dc.parse_args(["野猪", "半自动霰弹枪炮轰"])[0]  # Boar Prime: Auto
+check("野猪(Auto)：半自动炮轰不折算", close(_s_bc["base_dmg"], 0.0))
+check("野猪(Auto)：卡面注明拒绝原因", any("仅兼容半自动" in n for n in _s_bc["notes"]))
+check(
+    "拒绝的卡仍列在 mods（卡面可见）",
+    any(m.get("name") == "Semi-Shotgun Cannonade" for m in _s_bc["mods"]),
+)
+
+# ---------------------------------------------------------------------------
+# 2026-10-10 第三批 #12：火焰单例累加（wfsim data/debuffs/ignite.yaml:14-22,26-32）
+#   开火 T 秒、火触发率 r：r×6 ≥ 1 时平均 r×T/2 层；否则 r×6。默认 T = 12 ⇒ 与修前 r×6 逐位相同。
+_w_ig = dc.find_weapon("Ignis Wraith")[0]
+
+
+def _ss_ig(args):
+    s = dc.parse_args(list(args))[0]
+    return s, dc.calculate(s, _w_ig)["steady"]
+
+
+_s_def, _ss_def = _ss_ig(["火90", "多重100"])
+_s_12, _ss_12 = _ss_ig(["火90", "多重100", "开火12秒"])
+_s_30, _ss_30 = _ss_ig(["火90", "多重100", "开火30秒"])
+_s_3, _ss_3 = _ss_ig(["火90", "多重100", "开火3秒"])
+check("开火N秒：默认 fire_seconds = 12", _s_def["fire_seconds"] == 12.0)
+check(
+    "开火30秒 → fire_seconds 30；开火3秒 → 3",
+    _s_30["fire_seconds"] == 30.0 and _s_3["fire_seconds"] == 3.0,
+)
+_r_heat = _ss_def["procs_per_sec"]  # Ignis Wraith 火 100% ⇒ 火触发率 = 总触发率
+check(
+    "默认（T=12）火层数 = 触发率 × 6，与修前公式逐位相同",
+    _ss_def["heat_stacks"] == _r_heat * 6.0 and _ss_def["heat_refreshed"],
+    f"{_ss_def['heat_stacks']} vs {_r_heat * 6.0}",
+)
+check(
+    "显式「开火12秒」与默认逐位相同（层数 / 火 DoT / 总 DPS）",
+    _ss_12["heat_stacks"] == _ss_def["heat_stacks"]
+    and _ss_12["dots_detail"]["heat"] == _ss_def["dots_detail"]["heat"]
+    and _ss_12["dps_total"] == _ss_def["dps_total"],
+)
+check(
+    "开火30秒：火层数 = 触发率 × 15（单例累加线性爬升的窗口平均），火 DoT 按层数线性放大 ×2.5",
+    close(_ss_30["heat_stacks"], _r_heat * 15.0)
+    and close(_ss_30["dots_detail"]["heat"], _ss_def["dots_detail"]["heat"] * 2.5),
+    f"{_ss_30['heat_stacks']} / {_ss_30['dots_detail']['heat']}",
+)
+check(
+    "开火3秒：火层数 = 触发率 × 1.5；直伤部分不受 T 影响",
+    close(_ss_3["heat_stacks"], _r_heat * 1.5) and _ss_3["dps_direct"] == _ss_def["dps_direct"],
+)
+check(
+    "其它 DoT 不受 T 影响（Braton Prime 毒90：毒 DoT 开火 3 秒 = 默认）",
+    dc.calculate(dc.parse_args(["毒90", "开火3秒"])[0], dc.find_weapon("Braton Prime")[0])[
+        "steady"
+    ]["dots_detail"].get("toxin")
+    == dc.calculate(dc.parse_args(["毒90"])[0], dc.find_weapon("Braton Prime")[0])["steady"][
+        "dots_detail"
+    ].get("toxin"),
+)
+# 触发间隔 > 6s（r×6 < 1）：单例会过期，每层独立 ⇒ 仍是 r×6，与 T 无关
+_ss_slow = dc.steady_state_dps(
+    {"heat": 100.0},
+    100.0,
+    1.0,
+    {},
+    "Grineer",
+    0.1,
+    1.0,
+    0.1,
+    2.0,
+    3.0,
+    1.0,
+    1.0,
+    {"fire_seconds": 30.0, "_armor": 0.0},
+)
+check(
+    "触发率 0.1/s（间隔 10s > 6s）：火层数 = 0.6，不随 T 累加",
+    close(_ss_slow["heat_stacks"], 0.6) and not _ss_slow["heat_refreshed"],
+    str(_ss_slow["heat_stacks"]),
+)
+_lines_ig = dc.card_lines(_w_ig, _s_30, dc.calculate(_s_30, _w_ig), [])
+check(
+    "卡面注明火的单例累加口径与 T",
+    any("单例累加：开火 30s" in ln for ln in _lines_ig)
+    and any("开火 T 秒" in ln and "默认 12s" in ln for ln in _lines_ig),
+)
+_s_clamp = dc.parse_args(["开火0秒"])[0]
+check(
+    "开火0秒 夹到 1 秒并注明",
+    _s_clamp["fire_seconds"] == 1.0 and any("开火时长" in n for n in _s_clamp["notes"]),
+)
 
 if FAILED:
     print(f"\n失败 {len(FAILED)} 项：{FAILED}")
